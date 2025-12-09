@@ -1,5 +1,5 @@
 /*
- * RTEMS Configuration
+ * RTEMS Configuration for Satellite Tracking Controller
  */
 #include <rtems.h>
 #include <bsp.h>
@@ -7,12 +7,24 @@
 /* Forward declaration */
 extern "C" rtems_task Init(rtems_task_argument argument);
 
+/* Clock and console drivers */
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 
-#define CONFIGURE_MAXIMUM_TASKS 4
+/* Task configuration: Init (1) + GPS + Antenna + TLE + Pass + Controller (5) + system tasks */
+#define CONFIGURE_MAXIMUM_TASKS 16
 
+/* Message queue configuration */
+#define CONFIGURE_MAXIMUM_MESSAGE_QUEUES 5
+#define CONFIGURE_MESSAGE_BUFFER_MEMORY (8 * 1024)
+
+/* Semaphore configuration for mutexes */
+#define CONFIGURE_MAXIMUM_SEMAPHORES 5
+
+/* Init task configuration */
 #define CONFIGURE_RTEMS_INIT_TASKS_TABLE
+#define CONFIGURE_INIT_TASK_STACK_SIZE (16 * 1024)
+
 #define CONFIGURE_INIT
 
 #include <rtems/confdefs.h>
