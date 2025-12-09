@@ -9,12 +9,12 @@
 #ifndef __SATTRACK_SATELLITE_HPP
 #define __SATTRACK_SATELLITE_HPP
 
-#include <sgp4.hpp>
+#include "sgp4.hpp"
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <optional>
-#include <string>
 #include <string_view>
 #include <iostream>
 #include <map>
@@ -26,6 +26,22 @@ using time_point = std::chrono::system_clock::time_point;
 // Re-export SGP4 error codes
 using ErrorCode = sgp4::ErrorCode;
 
+// ============================================================================
+// Fixed-Size Buffer Constants
+// ============================================================================
+
+constexpr size_t MAX_TLE_LINE_LEN = 70;                      // 69 chars + null
+constexpr size_t MAX_SATELLITE_NAME_LEN = MAX_TLE_LINE_LEN;  // Same as line length
+constexpr size_t MAX_DESIGNATOR_LEN = 9;                     // 8 chars + null
+constexpr size_t MAX_TLE_LEN = MAX_TLE_LINE_LEN * 3;         // 3 lines
+
+/**
+ * Fixed-size buffer for TLE string output.
+ */
+struct TLEString {
+    char data[MAX_TLE_LEN];
+};
+
 // Astronomical constants
 constexpr double J2000_JD = 2451545.0;                      // Julian Date of J2000.0 epoch
 constexpr double DAYS_PER_JULIAN_CENTURY = 36525.0;         // Days in a Julian century
@@ -36,9 +52,9 @@ constexpr double EARTH_SIDEREAL_RATE = 360.98564736629;     // Earth's rotation 
 constexpr double GMST_T2_COEFF = 0.000387933;   // Quadratic correction for precession (T² term)
 constexpr double GMST_T3_DIVISOR = 38710000.0;  // Cubic correction divisor (T³ term)
 
-// Degree-radian conversion factors
-constexpr double DEGREES_TO_RADIANS = M_PI / 180.0;
-constexpr double RADIANS_TO_DEGREES = 180.0 / M_PI;
+// Degree-radian conversion factors (using PI from sgp4 namespace for portability)
+constexpr double DEGREES_TO_RADIANS = sgp4::PI / 180.0;
+constexpr double RADIANS_TO_DEGREES = 180.0 / sgp4::PI;
 
 // ============================================================================
 // Basic Data Types
@@ -111,14 +127,14 @@ struct LookAngles {
  * Information about a single satellite pass over a ground station.
  */
 struct PassInfo {
-    int noradID;                  ///< NORAD Catalog ID of the satellite
-    std::string name;             ///< Name of the satellite
-    time_point riseTime;          ///< When the satellite rises above the elevation threshold
-    time_point maxElevationTime;  ///< When the satellite reaches its highest point
-    time_point setTime;           ///< When the satellite sets below the elevation threshold
-    LookAngles riseAngles;        ///< Azimuth/elevation at rise
-    LookAngles maxAngles;         ///< Azimuth/elevation at maximum elevation
-    LookAngles setAngles;         ///< Azimuth/elevation at set
+    int noradID;                              ///< NORAD Catalog ID of the satellite
+    char name[MAX_SATELLITE_NAME_LEN];        ///< Name of the satellite
+    time_point riseTime;                      ///< When the satellite rises above the elevation threshold
+    time_point maxElevationTime;              ///< When the satellite reaches its highest point
+    time_point setTime;                       ///< When the satellite sets below the elevation threshold
+    LookAngles riseAngles;                    ///< Azimuth/elevation at rise
+    LookAngles maxAngles;                     ///< Azimuth/elevation at maximum elevation
+    LookAngles setAngles;                     ///< Azimuth/elevation at set
 };
 
 // ============================================================================
@@ -155,10 +171,10 @@ public:
     void updateFromTLE(const std::string_view &tle);
 
     // Accessors for TLE data
-    std::string getName() const;
+    const char* getName() const;
     int getNoradID() const;
     char getClassification() const;
-    std::string getDesignator() const;
+    const char* getDesignator() const;
     time_point getEpoch() const;
     double getFirstDerivativeMeanMotion() const;
     double getSecondDerivativeMeanMotion() const;
@@ -208,7 +224,7 @@ public:
     /**
      * Get TLE string representation.
      */
-    std::string getTLE() const;
+    TLEString getTLE() const;
 
 private:
     // ========================================================================
@@ -216,12 +232,12 @@ private:
     // ========================================================================
 
     // Satellite Identification
-    std::string name;
+    char name[MAX_SATELLITE_NAME_LEN] = {0};
 
     // First Line - Satellite Identification
     int noradID = 0;
     char classification = 'U';
-    std::string designator;
+    char designator[MAX_DESIGNATOR_LEN] = {0};
     time_point epoch;
     double firstDerivativeMeanMotion = 0.0;
     double secondDerivativeMeanMotion = 0.0;
@@ -257,9 +273,9 @@ void saveTLEDatabase(std::ostream &s, const std::map<int, Satellite> &database, 
 void saveTLEDatabase(const std::string &filepath, const std::map<int, Satellite> &database, std::ostream &logStream = std::cerr);
 
 // TLE formatting utilities
-int calculateChecksum(const std::string& line);
-std::string toTLEExponential(double value);
-std::string formatFirstDerivative(double value);
+int calculateChecksum(const char* line);
+void toTLEExponential(double value, char* out);
+void formatFirstDerivative(double value, char* out);
 
 // ============================================================================
 // Coordinate System Transformations and Time Functions

@@ -26,7 +26,7 @@ def configure(conf):
 
 def build(bld):
     rtems.build(bld)
-    bld(features = 'c cprogram',
+    bld(features = 'cxx cxxprogram',
         target = 'sattrack_controller.exe',
-        cflags = '-g -O2',
-        source = ['init.c', 'controller.c'])
+        cxxflags = '-std=c++17 -g -O2 -fno-exceptions -fno-rtti',
+        source = ['init.cpp', 'controller.cpp', 'satellite.cpp', 'sgp4.cpp'],)

@@ -13,11 +13,14 @@
 #include <cmath>
 #include <string>
 
-namespace sattrack::sgp4 {
+namespace sgp4 {
 
 // ============================================================================
 // SGP4 Constants
 // ============================================================================
+
+// Mathematical constants (defined here for portability - some toolchains don't provide M_PI)
+constexpr double PI = 3.14159265358979323846;
 
 // WGS84 / EGM-96 Constants
 constexpr double MU = 398600.8;                    // Earth gravitational parameter (km^3/s^2)
@@ -29,7 +32,7 @@ constexpr double J3OJ2 = J3 / J2;
 constexpr double XKE = 0.0743669161331734132;      // sqrt(GM) in Earth radii^1.5/min
 constexpr double TUMIN = 13.44683969695931;        // Minutes per time unit
 constexpr double VKMPERSEC = 7.905366149846074;    // km/s per velocity unit
-constexpr double TWO_PI = 2.0 * M_PI;
+constexpr double TWO_PI = 2.0 * PI;
 constexpr double X2O3 = 2.0 / 3.0;
 
 // ============================================================================

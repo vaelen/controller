@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-rtems_task Init(rtems_task_argument ignored)
+extern "C" rtems_task Init(rtems_task_argument ignored)
 {
     printf("\n*** HELLO WORLD ***\n");
     printf("Hello from RTEMS on Zynq QEMU!\n");

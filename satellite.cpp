@@ -3,20 +3,20 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <satellite.hpp>
+#include "satellite.hpp"
 
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <numbers>
-#include <ranges>
-#include <string>
-#include <string_view>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <string>
+#include <string_view>
 
-#include <date.h>
+#include "date.h"
 
 namespace sattrack {
 
@@ -48,12 +48,28 @@ inline T toNumber(const std::string_view &str) {
 // Helper function to convert exponential substring to numeric type
 inline double fromExponentialString(const std::string_view &str) {
     // Example input: "11606-4" -> 0.00011606
+    // Example input: "-11606-4" -> -0.00011606
 
-    bool isNegative = true;
-    auto pos = str.find('-');
-    if (pos == std::string_view::npos) {
-        isNegative = false;
-        pos = str.find('+');
+    if (str.empty()) {
+        return 0.0;
+    }
+
+    // Check for leading sign on the mantissa
+    size_t start = 0;
+    double mantissaSign = 1.0;
+    if (str[0] == '-') {
+        mantissaSign = -1.0;
+        start = 1;
+    } else if (str[0] == '+') {
+        start = 1;
+    }
+
+    // Find the exponent sign (skip the first character if it's a sign)
+    bool expNegative = true;
+    auto pos = str.find('-', start);
+    if (pos == std::string_view::npos || pos == start) {
+        expNegative = false;
+        pos = str.find('+', start);
         if (pos == std::string_view::npos) {
             // TODO: Address exception handling
             printf("Satellite Error: Invalid exponential format: %.*s\n", (int)str.size(), str.data());
@@ -61,12 +77,21 @@ inline double fromExponentialString(const std::string_view &str) {
         }
     }
 
-    std::string baseStr = "0." + std::string(str.substr(0, pos));
-    std::string_view exponentView = str.substr(pos + 1);
+    // Parse mantissa as integer (e.g., "11606" -> 11606)
+    std::string_view mantissaView = str.substr(start, pos - start);
+    int64_t mantissaInt = toNumber<int64_t>(mantissaView);
 
-    double base = toNumber<double>(baseStr);
+    // Parse exponent
+    std::string_view exponentView = str.substr(pos + 1);
     int exponent = toNumber<int>(exponentView);
-    double value = base * std::pow(10.0, isNegative ? -exponent : exponent);
+
+    // Convert mantissa to decimal: 11606 -> 0.11606
+    // Number of digits determines the divisor
+    double divisor = std::pow(10.0, mantissaView.size());
+    double mantissa = static_cast<double>(mantissaInt) / divisor;
+
+    // Apply exponent
+    double value = mantissaSign * mantissa * std::pow(10.0, expNegative ? -exponent : exponent);
     return value;
 }
 
@@ -87,7 +112,7 @@ auto parseEpoch(const std::string_view &epochStr) {
     int wholeDays = static_cast<int>(dayOfYear);
     double fracDays = dayOfYear - wholeDays;
 
-    auto date = sys_days{year{y}/January/1} + days{wholeDays - 1};
+    auto date = date::sys_days{date::year{y}/date::January/1} + date::days{wholeDays - 1};
     auto time = duration_cast<microseconds>(duration<double, std::ratio<86400>>{fracDays});
 
     return date + time;
@@ -97,7 +122,7 @@ auto parseEpoch(const std::string_view &epochStr) {
 double toJulianDate(time_point tp) {
     using namespace std::chrono;
 
-    auto daysSinceEpoch = duration_cast<duration<double, days::period>>(
+    auto daysSinceEpoch = duration_cast<duration<double, date::days::period>>(
         tp.time_since_epoch()
     ).count();
 
@@ -143,7 +168,7 @@ void Satellite::ensureSGP4Initialized() const {
         sgp4::ErrorCode err = sgp4::initialize(sgp4State_, elements);
         if (err != sgp4::ErrorCode::SUCCESS) {
             // TODO: Address exception handling
-            printf("Satellite Error: SGP4 initialization failed for satellite %s\n", name.c_str());
+            printf("Satellite Error: SGP4 initialization failed for satellite %s\n", name);
         }
     }
 }
@@ -159,7 +184,7 @@ Vec3 Satellite::getECI(double julianDate) const {
 
     if (result.error != sgp4::ErrorCode::SUCCESS) {
         // TODO: Address exception handling
-        printf("Satellite Error: SGP4 propagation failed for satellite %s\n", name.c_str());
+        printf("Satellite Error: SGP4 propagation failed for satellite %s\n", name);
         return {0.0, 0.0, 0.0};
     }
 
@@ -177,7 +202,7 @@ Vec3 Satellite::getVelocity(double julianDate) const {
 
     if (result.error != sgp4::ErrorCode::SUCCESS) {
         // TODO: Address exception handling
-        printf("Satellite Error: SGP4 propagation failed for satellite %s\n", name.c_str());
+        printf("Satellite Error: SGP4 propagation failed for satellite %s\n", name);
         return {0.0, 0.0, 0.0};
     }
 
@@ -289,7 +314,7 @@ LookAngles getLookAngles(const Vec3& satECEF, const Geodetic& observer) {
 
     // Normalize azimuth to [0, 2π)
     if (azimuth < 0) {
-        azimuth += 2.0 * std::numbers::pi;
+        azimuth += sgp4::TWO_PI;
     }
 
     return {azimuth, elevation, range};
@@ -503,16 +528,17 @@ std::optional<PassInfo> findNextPass(
     LookAngles maxAngles = getLookAngles(satellite, observer, maxJD);
     LookAngles setAngles = getLookAngles(satellite, observer, setJD);
 
-    return PassInfo{
-        .noradID = satellite.getNoradID(),
-        .name = satellite.getName(),
-        .riseTime = preciseRise,
-        .maxElevationTime = maxTime,
-        .setTime = preciseSet,
-        .riseAngles = riseAngles,
-        .maxAngles = maxAngles,
-        .setAngles = setAngles
-    };
+    PassInfo info;
+    info.noradID = satellite.getNoradID();
+    std::strncpy(info.name, satellite.getName(), MAX_SATELLITE_NAME_LEN - 1);
+    info.name[MAX_SATELLITE_NAME_LEN - 1] = '\0';
+    info.riseTime = preciseRise;
+    info.maxElevationTime = maxTime;
+    info.setTime = preciseSet;
+    info.riseAngles = riseAngles;
+    info.maxAngles = maxAngles;
+    info.setAngles = setAngles;
+    return info;
 }
 
 // Get geodetic location (lat, lon, alt) of the satellite at a given time
@@ -536,10 +562,17 @@ Geodetic Satellite::getGeodeticLocationAtTime(const double julianDate) const {
     return ecefToGeodetic(ecef);
 }
 
-// Update orbital elements from TLE data with a seperate name
-void Satellite::updateFromTLE(const std::string_view &name, const std::string_view &tle) {
+// Update orbital elements from TLE data with a separate name
+void Satellite::updateFromTLE(const std::string_view &satName, const std::string_view &tle) {
     updateFromTLE(tle);
-    this->name = std::string(name);
+    size_t len = satName.size() < MAX_SATELLITE_NAME_LEN - 1 ? satName.size() : MAX_SATELLITE_NAME_LEN - 1;
+    std::memcpy(this->name, satName.data(), len);
+    this->name[len] = '\0';
+}
+
+// Helper to check if a string_view starts with a prefix (C++17 compatible)
+static bool startsWith(const std::string_view &str, const std::string_view &prefix) {
+    return str.size() >= prefix.size() && str.substr(0, prefix.size()) == prefix;
 }
 
 // Update orbital elements from TLE data
@@ -549,16 +582,33 @@ void Satellite::updateFromTLE(const std::string_view &tle) {
 
     bool firstLineParsed = false;
     bool secondLineParsed = false;
-    for (auto line : tle | std::views::split('\n')) {
-        std::string_view lineView(line.begin(), line.end());
-        lineView = trimLeft(trimRight(lineView));
-        if (lineView.starts_with("1 ")) {
+
+    // Parse lines manually (C++17 compatible, no std::views::split)
+    size_t start = 0;
+    while (start < tle.size()) {
+        size_t end = tle.find('\n', start);
+        if (end == std::string_view::npos) {
+            end = tle.size();
+        }
+        std::string_view lineView = trimLeft(trimRight(tle.substr(start, end - start)));
+        start = end + 1;
+
+        if (lineView.empty()) {
+            continue;
+        }
+
+        if (startsWith(lineView, "1 ")) {
             // NORAD ID is columns 3-7
             noradID = toNumber<int>(trimLeft(lineView.substr(2, 5)));
             // Classification is column 8
             classification = lineView[7];
             // Designator is columns 10-17
-            designator = std::string(lineView.substr(9, 8));
+            {
+                std::string_view desig = lineView.substr(9, 8);
+                size_t len = desig.size() < MAX_DESIGNATOR_LEN - 1 ? desig.size() : MAX_DESIGNATOR_LEN - 1;
+                std::memcpy(designator, desig.data(), len);
+                designator[len] = '\0';
+            }
             // First Derivative of Mean Motion is columns 34-43
             firstDerivativeMeanMotion = toNumber<double>(trimLeft(lineView.substr(33, 10)));
             // Second Derivative of Mean Motion is columns 45-52 (exponential format)
@@ -570,13 +620,15 @@ void Satellite::updateFromTLE(const std::string_view &tle) {
             // Element Set Number is columns 65-68
             elementSetNumber = toNumber<int>(trimLeft(lineView.substr(64, 4)));
             firstLineParsed = true;
-        } else if (lineView.starts_with("2 ")) {
+        } else if (startsWith(lineView, "2 ")) {
             // Inclination is columns 9-16
             inclination = toNumber<double>(trimLeft(lineView.substr(8, 8)));
             // RAAN is columns 18-25
             rightAscensionOfAscendingNode = toNumber<double>(trimLeft(lineView.substr(17, 8)));
             // Eccentricity is columns 27-33 (decimal implied)
-            eccentricity = toNumber<double>("0." + std::string(trimLeft(lineView.substr(26, 7))));
+            // Parse as integer and divide by 10,000,000 to get decimal
+            int64_t eccInt = toNumber<int64_t>(trimLeft(lineView.substr(26, 7)));
+            eccentricity = static_cast<double>(eccInt) / 10000000.0;
             // Argument of perigee is columns 35-42
             argumentOfPerigee = toNumber<double>(trimLeft(lineView.substr(34, 8)));
             // Mean Anomaly is columns 44-51
@@ -588,7 +640,9 @@ void Satellite::updateFromTLE(const std::string_view &tle) {
             secondLineParsed = true;
         } else if (!firstLineParsed && !secondLineParsed && !lineView.empty()) {
             // If neither line has been parsed and this line is not empty, assume it's the name
-            name = std::string(lineView);
+            size_t len = lineView.size() < MAX_SATELLITE_NAME_LEN - 1 ? lineView.size() : MAX_SATELLITE_NAME_LEN - 1;
+            std::memcpy(name, lineView.data(), len);
+            name[len] = '\0';
         }
 
         if (firstLineParsed && secondLineParsed) {
@@ -605,7 +659,7 @@ char Satellite::getClassification() const {
     return classification;
 }
 
-std::string Satellite::getDesignator() const {
+const char* Satellite::getDesignator() const {
     return designator;
 }
 
@@ -657,7 +711,7 @@ int Satellite::getRevolutionNumberAtEpoch() const {
     return revolutionNumberAtEpoch;
 }
 
-std::string Satellite::getName() const {
+const char* Satellite::getName() const {
     return name;
 }
 
@@ -683,12 +737,12 @@ void Satellite::printInfo(std::ostream &os) const {
 }
 
 // Calculate TLE line checksum (mod 10 sum of digits, with '-' counting as 1)
-int calculateChecksum(const std::string& line) {
+int calculateChecksum(const char* line) {
     int sum = 0;
-    for (char c : line) {
-        if (c >= '0' && c <= '9') {
-            sum += (c - '0');
-        } else if (c == '-') {
+    for (const char* p = line; *p != '\0'; p++) {
+        if (*p >= '0' && *p <= '9') {
+            sum += (*p - '0');
+        } else if (*p == '-') {
             sum += 1;
         }
     }
@@ -697,9 +751,11 @@ int calculateChecksum(const std::string& line) {
 
 // Format a value in TLE exponential notation (e.g., " 00000+0" or " 15237-3" or "-12345-6")
 // The format is: [sign]NNNNN[sign]E where NNNNN is 5 digits of mantissa and E is exponent
-std::string toTLEExponential(double value) {
+// Writes exactly 8 characters to out (no null terminator)
+void toTLEExponential(double value, char* out) {
     if (value == 0.0) {
-        return " 00000+0";
+        std::memcpy(out, " 00000+0", 8);
+        return;
     }
 
     char sign = (value >= 0) ? ' ' : '-';
@@ -724,54 +780,83 @@ std::string toTLEExponential(double value) {
     char expSign = (exponent + 1 >= 0) ? '+' : '-';
     int expAbs = std::abs(exponent + 1);
 
-    std::ostringstream ss;
-    ss << sign << std::setw(5) << std::setfill('0') << mantissaInt << expSign << expAbs;
-    return ss.str();
+    // Write directly: [sign]NNNNN[expSign]E
+    out[0] = sign;
+    out[1] = '0' + (mantissaInt / 10000) % 10;
+    out[2] = '0' + (mantissaInt / 1000) % 10;
+    out[3] = '0' + (mantissaInt / 100) % 10;
+    out[4] = '0' + (mantissaInt / 10) % 10;
+    out[5] = '0' + mantissaInt % 10;
+    out[6] = expSign;
+    out[7] = '0' + expAbs % 10;
 }
 
 // Format first derivative of mean motion for TLE (e.g., " .00008010" or "-.00012345")
-std::string formatFirstDerivative(double value) {
+// Writes exactly 10 characters to out (no null terminator)
+void formatFirstDerivative(double value, char* out) {
     char sign = (value >= 0) ? ' ' : '-';
     value = std::abs(value);
 
-    std::ostringstream ss;
-    ss << sign << '.' << std::setw(8) << std::setfill('0')
-       << static_cast<int>(std::round(value * 100000000));
-    return ss.str();
+    int64_t intVal = static_cast<int64_t>(std::round(value * 100000000));
+
+    // Write directly: [sign].NNNNNNNN
+    out[0] = sign;
+    out[1] = '.';
+    out[2] = '0' + (intVal / 10000000) % 10;
+    out[3] = '0' + (intVal / 1000000) % 10;
+    out[4] = '0' + (intVal / 100000) % 10;
+    out[5] = '0' + (intVal / 10000) % 10;
+    out[6] = '0' + (intVal / 1000) % 10;
+    out[7] = '0' + (intVal / 100) % 10;
+    out[8] = '0' + (intVal / 10) % 10;
+    out[9] = '0' + intVal % 10;
+}
+
+// Calculate TLE line checksum (mod 10 sum of digits, with '-' counting as 1)
+// Works with fixed-size line buffer (68 chars before checksum)
+static int calculateLineChecksum(const char* line, size_t len) {
+    int sum = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = line[i];
+        if (c >= '0' && c <= '9') {
+            sum += (c - '0');
+        } else if (c == '-') {
+            sum += 1;
+        }
+    }
+    return sum % 10;
 }
 
 // Get standard 3-line TLE representation of the orbital elements
-std::string Satellite::getTLE() const {
+TLEString Satellite::getTLE() const {
     using namespace std::chrono;
 
-    std::ostringstream tleStream;
+    TLEString result;
+    char* p = result.data;
 
     // Line 0: Name
-    tleStream << name << '\n';
+    size_t nameLen = std::strlen(name);
+    std::memcpy(p, name, nameLen);
+    p += nameLen;
+    *p++ = '\n';
 
     // Line 1
     // Compute epoch in TLE format: YYDDD.DDDDDDDD
-    auto epochDays = floor<days>(epoch);
-    year_month_day ymd{epochDays};
+    auto epochDays = date::floor<date::days>(epoch);
+    date::year_month_day ymd{epochDays};
     int year = static_cast<int>(ymd.year());
     int twoDigitYear = year % 100;
 
     // Day of year (1-366)
-    auto yearStart = sys_days{ymd.year()/January/1};
+    auto yearStart = date::sys_days{ymd.year()/date::January/1};
     int dayOfYear = (epochDays - yearStart).count() + 1;
 
     // Fractional part of day
     auto timeOfDay = epoch - epochDays;
     double fracDay = duration_cast<duration<double, std::ratio<86400>>>(timeOfDay).count();
+    long fracDayInt = static_cast<long>(std::round(fracDay * 100000000));
 
-    // Format epoch string (14 chars: YYDDD.DDDDDDDD)
-    std::ostringstream epochStr;
-    epochStr << std::setw(2) << std::setfill('0') << twoDigitYear
-             << std::setw(3) << std::setfill('0') << dayOfYear
-             << '.' << std::setw(8) << std::setfill('0')
-             << static_cast<long>(std::round(fracDay * 100000000));
-
-    // Build line 1 without checksum (68 chars), then add checksum
+    // Build line 1 (68 chars + checksum + newline)
     // TLE Line 1 format (columns 1-indexed):
     // Col 01: Line number (1)
     // Col 02: Space
@@ -792,23 +877,41 @@ std::string Satellite::getTLE() const {
     // Col 64: Space
     // Col 65-68: Element Set Number (4 digits, right-justified, space-padded)
     // Col 69: Checksum
-    std::ostringstream line1;
-    line1 << "1 "
-          << std::setw(5) << std::setfill('0') << noradID
-          << classification << ' '
-          << std::left << std::setw(8) << std::setfill(' ') << designator << ' '
-          << epochStr.str() << ' '
-          << formatFirstDerivative(firstDerivativeMeanMotion) << ' '
-          << toTLEExponential(secondDerivativeMeanMotion) << ' '
-          << toTLEExponential(bstarDragTerm) << ' '
-          << "0 "
-          << std::right << std::setw(4) << std::setfill(' ') << (elementSetNumber % 10000);
 
-    std::string line1Str = line1.str();
-    int checksum1 = calculateChecksum(line1Str);
-    tleStream << line1Str << checksum1 << '\n';
+    char* line1Start = p;
 
-    // Build line 2 without checksum (68 chars), then add checksum
+    // "1 " + NORAD ID (5) + classification + " " + designator (8) + " "
+    int written = snprintf(p, 20, "1 %05d%c %-8s ", noradID, classification, designator);
+    p += written;
+
+    // Epoch (14 chars: YYDDD.DDDDDDDD) + " "
+    written = snprintf(p, 16, "%02d%03d.%08ld ", twoDigitYear, dayOfYear, fracDayInt);
+    p += written;
+
+    // First derivative (10 chars) - write directly
+    formatFirstDerivative(firstDerivativeMeanMotion, p);
+    p += 10;
+    *p++ = ' ';
+
+    // Second derivative (8 chars) - write directly
+    toTLEExponential(secondDerivativeMeanMotion, p);
+    p += 8;
+    *p++ = ' ';
+
+    // BSTAR (8 chars) - write directly
+    toTLEExponential(bstarDragTerm, p);
+    p += 8;
+
+    // " 0 " + element set number (4 digits, space-padded)
+    written = snprintf(p, 8, " 0 %4d", elementSetNumber % 10000);
+    p += written;
+
+    // Calculate and append checksum
+    int checksum1 = calculateLineChecksum(line1Start, 68);
+    *p++ = '0' + checksum1;
+    *p++ = '\n';
+
+    // Line 2
     // TLE Line 2 format (columns 1-indexed):
     // Col 01: Line number (2)
     // Col 02: Space
@@ -827,29 +930,29 @@ std::string Satellite::getTLE() const {
     // Col 53-63: Mean Motion (11 chars: XX.XXXXXXXX)
     // Col 64-68: Revolution Number at Epoch (5 digits)
     // Col 69: Checksum
+
+    char* line2Start = p;
     int eccInt = static_cast<int>(std::round(eccentricity * 10000000));
 
-    std::ostringstream line2;
-    line2 << "2 "
-          << std::setw(5) << std::setfill('0') << noradID << ' '
-          << std::right << std::setw(8) << std::setfill(' ')
-          << std::fixed << std::setprecision(4) << inclination << ' '
-          << std::right << std::setw(8) << std::setfill(' ')
-          << std::fixed << std::setprecision(4) << rightAscensionOfAscendingNode << ' '
-          << std::setw(7) << std::setfill('0') << eccInt << ' '
-          << std::right << std::setw(8) << std::setfill(' ')
-          << std::fixed << std::setprecision(4) << argumentOfPerigee << ' '
-          << std::right << std::setw(8) << std::setfill(' ')
-          << std::fixed << std::setprecision(4) << meanAnomaly << ' '
-          << std::right << std::setw(11) << std::setfill(' ')
-          << std::fixed << std::setprecision(8) << meanMotion
-          << std::setw(5) << std::setfill('0') << (revolutionNumberAtEpoch % 100000);
+    written = snprintf(p, 70,
+        "2 %05d %8.4f %8.4f %07d %8.4f %8.4f %11.8f%05d",
+        noradID,
+        inclination,
+        rightAscensionOfAscendingNode,
+        eccInt,
+        argumentOfPerigee,
+        meanAnomaly,
+        meanMotion,
+        revolutionNumberAtEpoch % 100000);
+    p += written;
 
-    std::string line2Str = line2.str();
-    int checksum2 = calculateChecksum(line2Str);
-    tleStream << line2Str << checksum2 << '\n';
+    // Calculate and append checksum
+    int checksum2 = calculateLineChecksum(line2Start, 68);
+    *p++ = '0' + checksum2;
+    *p++ = '\n';
+    *p = '\0';
 
-    return tleStream.str();
+    return result;
 }
 
 // Load TLE database from file using the standard 3-line TLE format
@@ -878,10 +981,10 @@ void loadTLEDatabase(std::istream &s, std::map<int, Satellite> &database, std::o
     while (std::getline(s, line)) {
         if (line.empty()) continue;
 
-        if (line.starts_with("1 ")) {
+        if (line.size() >= 2 && line[0] == '1' && line[1] == ' ') {
             line1 = line;
             haveFirstLine = true;
-        } else if (line.starts_with("2 ")) {
+        } else if (line.size() >= 2 && line[0] == '2' && line[1] == ' ') {
             line2 = line;
             haveSecondLine = true;
         } else {
@@ -928,7 +1031,8 @@ void saveTLEDatabase(std::ostream &s, const std::map<int, Satellite> &database, 
     logStream << "Saving TLE database... " << std::flush;
     int count = 0;
     for (const auto &[id, satellite] : database) {
-        s << satellite.getTLE();
+        TLEString tle = satellite.getTLE();
+        s << tle.data;
         count++;
     }
     logStream << " done." << std::endl;

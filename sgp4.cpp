@@ -7,12 +7,12 @@
  * See: https://celestrak.org/software/vallado-sw.php
  */
 
-#include <sgp4.hpp>
+#include "sgp4.hpp"
 
 #include <cmath>
 #include <cstdio>
 
-namespace sattrack::sgp4 {
+namespace sgp4 {
 
 // Compute Greenwich Sidereal Time at epoch for SGP4
 double gstime(double jdut1) {
@@ -21,7 +21,7 @@ double gstime(double jdut1) {
                   + 0.093104 * tut1 * tut1
                   + (876600.0 * 3600 + 8640184.812866) * tut1
                   + 67310.54841;
-    constexpr double DEG_TO_RAD = M_PI / 180.0;
+    constexpr double DEG_TO_RAD = PI / 180.0;
     temp = std::fmod(temp * DEG_TO_RAD / 240.0, TWO_PI);
     if (temp < 0.0) temp += TWO_PI;
     return temp;
@@ -417,7 +417,7 @@ void initializeDeepSpace(
     double sghs = state.sgh2 * f2 + state.sgh3 * f3 + state.sgh4 * sinomm;
     double shs = state.sh2 * f2 + state.sh3 * f3;
 
-    if (state.inclo < 5.2359877e-2 || state.inclo > M_PI - 5.2359877e-2) {
+    if (state.inclo < 5.2359877e-2 || state.inclo > PI - 5.2359877e-2) {
         shs = 0.0;
     }
     if (sinim != 0.0) {
@@ -430,7 +430,7 @@ void initializeDeepSpace(
     double sghl = state.xgh2 * f2 + state.xgh3 * f3 + state.xgh4 * sinomm;
     double shll = state.xh2 * f2 + state.xh3 * f3;
 
-    if (state.inclo < 5.2359877e-2 || state.inclo > M_PI - 5.2359877e-2) {
+    if (state.inclo < 5.2359877e-2 || state.inclo > PI - 5.2359877e-2) {
         shll = 0.0;
     }
 
