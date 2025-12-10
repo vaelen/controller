@@ -5,7 +5,7 @@
 #include <bsp.h>
 
 /* Forward declaration */
-extern "C" rtems_task Init(rtems_task_argument argument);
+rtems_task Init(rtems_task_argument argument);
 
 /* Clock and console drivers */
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER

@@ -16,87 +16,115 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <map>
+#include <stdbool.h>
+#include <time.h>
 
-#include "satellite.hpp"
+#include "sgp4.h"
+
+// ============================================================================
+// Configuration Constants
+// ============================================================================
+
+#define MAX_SATELLITES 32
 
 // ============================================================================
 // Message Types
 // ============================================================================
 
-enum class MessageType : uint8_t {
-    GPS_UPDATE,
-    TLE_DATABASE_UPDATED,
-    PASS_CALCULATED,
-    ANTENNA_POSITION,
-    COMMAND_ANTENNA
-};
+typedef enum {
+    MSG_GPS_UPDATE,
+    MSG_TLE_DATABASE_UPDATED,
+    MSG_PASS_CALCULATED,
+    MSG_ANTENNA_POSITION,
+    MSG_COMMAND_ANTENNA
+} message_type_t;
+
+// Pass information structure
+typedef struct {
+    int norad_id;
+    double aos_jd;           // Acquisition of signal (Julian Date)
+    double los_jd;           // Loss of signal (Julian Date)
+    double max_elevation_rad;
+    double aos_azimuth_rad;
+    double los_azimuth_rad;
+} pass_info_t;
 
 // GPS position and time update message
-struct GpsMessage {
-    MessageType type;
-    sattrack::Geodetic location;
-    time_t utcTime;
-};
+typedef struct {
+    message_type_t type;
+    sgp4_geodetic_t location;
+    time_t utc_time;
+} gps_message_t;
 
 // Antenna current position message
-struct AntennaPositionMessage {
-    MessageType type;
+typedef struct {
+    message_type_t type;
     double azimuth;    // radians
     double elevation;  // radians
-};
+} antenna_position_message_t;
 
 // Antenna command message
-struct AntennaCommandMessage {
-    MessageType type;
-    double targetAzimuth;    // radians
-    double targetElevation;  // radians
-};
+typedef struct {
+    message_type_t type;
+    double target_azimuth;    // radians
+    double target_elevation;  // radians
+} antenna_command_message_t;
 
 // Pass notification message
-struct PassMessage {
-    MessageType type;
-    sattrack::PassInfo pass;
-};
+typedef struct {
+    message_type_t type;
+    pass_info_t pass;
+} pass_message_t;
 
 // TLE update notification (simple flag)
-struct TleUpdateMessage {
-    MessageType type;
-};
+typedef struct {
+    message_type_t type;
+} tle_update_message_t;
 
 // Union of all message types for queue sizing
-union ControllerMessage {
-    MessageType type;
-    GpsMessage gps;
-    AntennaPositionMessage antennaPos;
-    AntennaCommandMessage antennaCmd;
-    PassMessage pass;
-    TleUpdateMessage tleUpdate;
-};
+typedef union {
+    message_type_t type;
+    gps_message_t gps;
+    antenna_position_message_t antenna_pos;
+    antenna_command_message_t antenna_cmd;
+    pass_message_t pass;
+    tle_update_message_t tle_update;
+} controller_message_t;
+
+// ============================================================================
+// Satellite entry for TLE database
+// ============================================================================
+
+typedef struct {
+    bool valid;
+    sgp4_tle_t tle;
+    sgp4_state_t state;
+} satellite_entry_t;
 
 // ============================================================================
 // Shared State (protected by mutexes)
 // ============================================================================
 
-struct ControllerState {
+typedef struct {
     // Observer location from GPS
-    sattrack::Geodetic observerLocation;
-    bool locationValid;
+    sgp4_geodetic_t observer_location;
+    bool location_valid;
 
     // Current time from GPS
-    sattrack::time_point currentTime;
-    bool timeValid;
+    time_t current_time;
+    bool time_valid;
 
-    // TLE database
-    std::map<int, sattrack::Satellite> tleDatabase;
+    // TLE database (fixed-size array instead of std::map)
+    satellite_entry_t satellites[MAX_SATELLITES];
+    int satellite_count;
 
     // Current antenna position
-    double antennaAzimuth;    // radians
-    double antennaElevation;  // radians
-    bool antennaPositionValid;
-};
+    double antenna_azimuth;    // radians
+    double antenna_elevation;  // radians
+    bool antenna_position_valid;
+} controller_state_t;
 
-static ControllerState g_state;
+static controller_state_t g_state;
 
 // ============================================================================
 // IPC Object IDs
@@ -124,19 +152,17 @@ static rtems_id g_controller_task_id;
 // Task Priorities and Stack Sizes
 // ============================================================================
 
-constexpr rtems_task_priority PRIORITY_CONTROLLER = 10;
-constexpr rtems_task_priority PRIORITY_ANTENNA = 20;
-constexpr rtems_task_priority PRIORITY_GPS = 30;
-constexpr rtems_task_priority PRIORITY_PASS = 40;
-constexpr rtems_task_priority PRIORITY_TLE = 50;
+#define PRIORITY_CONTROLLER 10
+#define PRIORITY_ANTENNA    20
+#define PRIORITY_GPS        30
+#define PRIORITY_PASS       40
+#define PRIORITY_TLE        50
 
-constexpr size_t TASK_STACK_SIZE = 8 * 1024;
+#define TASK_STACK_SIZE     (8 * 1024)
 
 // ============================================================================
-// Task Entry Points (extern "C" for RTEMS)
+// Task Entry Points
 // ============================================================================
-
-extern "C" {
 
 /*
  * GPS Task
@@ -154,7 +180,7 @@ rtems_task gps_task(rtems_task_argument arg) {
         // TODO: Read UART data
         // TODO: Parse NMEA sentences (GGA for position, RMC for time)
         // TODO: Extract latitude, longitude, altitude, and UTC time
-        // TODO: Send GpsMessage to g_gps_queue
+        // TODO: Send gps_message_t to g_gps_queue
 
         // Stub: simulate periodic GPS update
         rtems_task_wake_after(rtems_clock_get_ticks_per_second());
@@ -178,7 +204,7 @@ rtems_task antenna_location_task(rtems_task_argument arg) {
         // TODO: Read response with current az/el
         // TODO: Release g_uart1_mutex
         // TODO: Parse response to get azimuth and elevation
-        // TODO: Send AntennaPositionMessage to g_antenna_queue
+        // TODO: Send antenna_position_message_t to g_antenna_queue
 
         // Stub: simulate periodic position read
         rtems_task_wake_after(2 * rtems_clock_get_ticks_per_second());
@@ -199,9 +225,9 @@ rtems_task tle_updater_task(rtems_task_argument arg) {
     while (true) {
         // TODO: Fetch TLE data from source (network, file, etc.)
         // TODO: Acquire g_tle_database_mutex
-        // TODO: Update g_state.tleDatabase with new TLE data
+        // TODO: Update g_state.satellites with new TLE data
         // TODO: Release g_tle_database_mutex
-        // TODO: Send TleUpdateMessage to g_tle_queue to notify controller
+        // TODO: Send tle_update_message_t to g_tle_queue to notify controller
 
         // Stub: simulate periodic TLE update (every 4 hours)
         rtems_task_wake_after(4 * 60 * 60 * rtems_clock_get_ticks_per_second());
@@ -223,8 +249,9 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
         // TODO: Acquire g_state_mutex to read observer location
         // TODO: Acquire g_tle_database_mutex to read TLE database
         // TODO: For each satellite in database:
-        //       - Call sattrack::findNextPass() with observer location
-        //       - If pass found within window, send PassMessage to g_pass_queue
+        //       - Propagate satellite position
+        //       - Calculate look angles
+        //       - If pass found within window, send pass_message_t to g_pass_queue
         // TODO: Release mutexes
 
         // Stub: simulate periodic pass calculation (every hour)
@@ -266,20 +293,18 @@ rtems_task controller_task(rtems_task_argument arg) {
     }
 }
 
-} // extern "C"
-
 // ============================================================================
 // IPC and Task Initialization
 // ============================================================================
 
-static rtems_status_code create_message_queues() {
+static rtems_status_code create_message_queues(void) {
     rtems_status_code status;
 
     // GPS to Controller queue
     status = rtems_message_queue_create(
         rtems_build_name('G', 'P', 'S', 'Q'),
         4,  // max messages
-        sizeof(GpsMessage),
+        sizeof(gps_message_t),
         RTEMS_DEFAULT_ATTRIBUTES,
         &g_gps_queue
     );
@@ -292,7 +317,7 @@ static rtems_status_code create_message_queues() {
     status = rtems_message_queue_create(
         rtems_build_name('A', 'N', 'T', 'Q'),
         4,
-        sizeof(AntennaPositionMessage),
+        sizeof(antenna_position_message_t),
         RTEMS_DEFAULT_ATTRIBUTES,
         &g_antenna_queue
     );
@@ -305,7 +330,7 @@ static rtems_status_code create_message_queues() {
     status = rtems_message_queue_create(
         rtems_build_name('T', 'L', 'E', 'Q'),
         2,
-        sizeof(TleUpdateMessage),
+        sizeof(tle_update_message_t),
         RTEMS_DEFAULT_ATTRIBUTES,
         &g_tle_queue
     );
@@ -318,7 +343,7 @@ static rtems_status_code create_message_queues() {
     status = rtems_message_queue_create(
         rtems_build_name('P', 'A', 'S', 'Q'),
         16,  // multiple passes can be queued
-        sizeof(PassMessage),
+        sizeof(pass_message_t),
         RTEMS_DEFAULT_ATTRIBUTES,
         &g_pass_queue
     );
@@ -331,7 +356,7 @@ static rtems_status_code create_message_queues() {
     return RTEMS_SUCCESSFUL;
 }
 
-static rtems_status_code create_semaphores() {
+static rtems_status_code create_semaphores(void) {
     rtems_status_code status;
 
     // UART1 mutex (for antenna rotator communication)
@@ -377,7 +402,7 @@ static rtems_status_code create_semaphores() {
     return RTEMS_SUCCESSFUL;
 }
 
-static rtems_status_code create_and_start_tasks() {
+static rtems_status_code create_and_start_tasks(void) {
     rtems_status_code status;
 
     // Create GPS task
@@ -476,7 +501,7 @@ static rtems_status_code create_and_start_tasks() {
 // Init Task (entry point)
 // ============================================================================
 
-extern "C" rtems_task Init(rtems_task_argument ignored) {
+rtems_task Init(rtems_task_argument ignored) {
     (void)ignored;
     rtems_status_code status;
 
@@ -485,9 +510,10 @@ extern "C" rtems_task Init(rtems_task_argument ignored) {
 
     // Initialize shared state
     memset(&g_state, 0, sizeof(g_state));
-    g_state.locationValid = false;
-    g_state.timeValid = false;
-    g_state.antennaPositionValid = false;
+    g_state.location_valid = false;
+    g_state.time_valid = false;
+    g_state.antenna_position_valid = false;
+    g_state.satellite_count = 0;
 
     // Create IPC objects
     status = create_message_queues();

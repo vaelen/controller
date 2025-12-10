@@ -27,29 +27,12 @@ def configure(conf):
 def build(bld):
     rtems.build(bld)
 
-    # Common C++ flags
-    common_cxxflags = '-std=c++17 -g -O2 -fno-exceptions -fno-rtti'
+    # Common C flags
+    common_cflags = '-g -O2'
 
     # Main application
-    bld(features = 'cxx cxxprogram',
+    bld(features = 'c cprogram',
         target = 'sattrack_controller.exe',
-        cxxflags = common_cxxflags,
-        source = ['init.cpp', 'controller.cpp', 'satellite.cpp', 'sgp4.cpp'],)
+        cflags = common_cflags,
+        source = ['init.c', 'controller.c', 'sgp4.c'],)
 
-    # Test executables - SGP4 algorithm tests
-    bld(features = 'cxx cxxprogram',
-        target = 'test_sgp4.exe',
-        cxxflags = common_cxxflags,
-        source = ['test_init.cpp', 'test_sgp4.cpp', 'sgp4.cpp'],)
-
-    # Test executables - Satellite class tests
-    bld(features = 'cxx cxxprogram',
-        target = 'test_satellite.exe',
-        cxxflags = common_cxxflags,
-        source = ['test_init.cpp', 'test_satellite.cpp', 'satellite.cpp', 'sgp4.cpp'],)
-
-    # Test executables - Coordinate system tests
-    bld(features = 'cxx cxxprogram',
-        target = 'test_coordinates.exe',
-        cxxflags = common_cxxflags,
-        source = ['test_init.cpp', 'test_coordinates.cpp', 'satellite.cpp', 'sgp4.cpp'],)
