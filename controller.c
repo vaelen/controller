@@ -315,7 +315,7 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
     /* Ignore modem control lines */
     tty.c_cflag |= CLOCAL;
 
-    /* Enable receiver if reading */
+    /* Enable receiver if reading */0
     if ((flags & O_RDONLY) || (flags & O_RDWR)) {
         tty.c_cflag |= CREAD;
 
@@ -398,7 +398,9 @@ rtems_task gps_task(rtems_task_argument arg) {
         if (n > 0) {
             read_buf[n] = '\0';
             nmea_buffer_add(&nmea_buf, read_buf, (int)n);
-        }
+            }
+
+        LOG_DEBUG("GPS", "Read %zd bytes from GPS", n);
 
         /* Process complete lines from buffer */
         while (nmea_buffer_get_line(&nmea_buf, line, sizeof(line))) {

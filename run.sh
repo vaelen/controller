@@ -10,6 +10,6 @@ qemu-system-arm -M realview-pbx-a9 -m 256M -no-reboot \
     -serial mon:stdio \
     -serial /dev/ttyUSB0 \
     -serial /dev/ttyACM1 \
-    -serial /dev/ttyACM0 \
+    -serial /dev/ttyS0 \
     -nographic \
     -kernel build/arm-rtems7-realview_pbx_a9_qemu/sattrack_controller.exe

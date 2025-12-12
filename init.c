@@ -25,6 +25,9 @@ rtems_task Init(rtems_task_argument argument);
 /* Semaphore configuration for mutexes */
 #define CONFIGURE_MAXIMUM_SEMAPHORES 5
 
+/* File descriptor configuration: stdin/stdout/stderr (3) + GPS + Rotator + Radio + spare */
+#define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 16
+
 /* Init task configuration */
 #define CONFIGURE_RTEMS_INIT_TASKS_TABLE
 #define CONFIGURE_INIT_TASK_STACK_SIZE (16 * 1024)
