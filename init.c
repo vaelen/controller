@@ -18,9 +18,9 @@ rtems_task Init(rtems_task_argument argument);
 /* Task configuration: Init (1) + GPS + Antenna + TLE + Pass + PassExec + Controller (6) + system tasks */
 #define CONFIGURE_MAXIMUM_TASKS 16
 
-/* Message queue configuration */
-#define CONFIGURE_MAXIMUM_MESSAGE_QUEUES 5
-#define CONFIGURE_MESSAGE_BUFFER_MEMORY (8 * 1024)
+/* Message queue configuration (5 app queues + 1 log queue) */
+#define CONFIGURE_MAXIMUM_MESSAGE_QUEUES 6
+#define CONFIGURE_MESSAGE_BUFFER_MEMORY (12 * 1024)
 
 /* Semaphore configuration for mutexes */
 #define CONFIGURE_MAXIMUM_SEMAPHORES 5

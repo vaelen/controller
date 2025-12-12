@@ -65,9 +65,24 @@ This is a satellite tracking controller for RTEMS embedded systems. The codebase
 ## Key Constraints
 
 - **C99**: All code must be C99 compatible
-- **No exceptions**: All error handling uses error codes and `printf()` for diagnostics
+- **No exceptions**: All error handling uses error codes and the logging system for diagnostics
 - **No heap allocation** in core code: Uses fixed-size buffers and structs
 - **Non-blocking I/O**: Serial reads use termios with `VMIN=0, VTIME=0`
+
+## Logging
+
+The logging system uses a semaphore (mutex) to protect `printf` from concurrent access. Each task can call the logging macros directly, and the semaphore ensures output is not interleaved.
+
+```c
+LOG_DEBUG("TAG", "Debug message: %d", value);
+LOG_INFO("TAG", "Informational message");
+LOG_WARN("TAG", "Warning message");
+LOG_ERROR("TAG", "Error message: %s", error_str);
+```
+
+Output format: `[HH:MM:SS] LEVEL [TAG    ] message`
+
+Log levels: DEBUG < INFO < WARN < ERROR. Default level is INFO.
 
 ## Copyright Header Requirement
 
@@ -95,9 +110,9 @@ All angles in the library are in **radians** unless explicitly noted (e.g., orbi
 
 ## Serial Port Configuration
 
-| Port         | Device      | Function     | Baud  |
-|--------------|-------------|--------------|-------|
-| `/dev/ttyS0` | Console     | stdio        | -     |
-| `/dev/ttyS1` | GPS         | NMEA input   | 9600  |
-| `/dev/ttyS2` | Rotator     | Az/El control| 9600  |
-| `/dev/ttyS3` | Radio       | Frequency/PTT| 9600  |
+| Port         | Device  | Function      | Baud   |
+|--------------|---------|---------------|--------|
+| `/dev/ttyS0` | Console | Log output    | 115200 |
+| `/dev/ttyS1` | GPS     | NMEA input    | 9600   |
+| `/dev/ttyS2` | Rotator | Az/El control | 9600   |
+| `/dev/ttyS3` | Radio   | Frequency/PTT | 9600   |

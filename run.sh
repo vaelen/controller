@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# Serial port mapping:
+# Serial port mapping for Realview PBX-A9:
 #   ttyS0 -> Console (stdio)
 #   ttyS1 -> GPS (/dev/ttyUSB0)
-#   ttyS2 -> Rotator (/dev/ttyUSB1)
-#   ttyS3 -> Radio (/dev/ttyUSB2)
+#   ttyS2 -> Rotator (/dev/ttyACM0)
+#   ttyS3 -> Radio (/dev/ttyACM1)
 
-qemu-system-arm -M xilinx-zynq-a9 -m 256M -no-reboot \
+qemu-system-arm -M realview-pbx-a9 -m 256M -no-reboot \
     -serial mon:stdio \
     -serial /dev/ttyUSB0 \
-    -serial /dev/ttyUSB1 \
-    -serial /dev/ttyUSB2 \
+    -serial /dev/ttyACM1 \
+    -serial /dev/ttyACM0 \
     -nographic \
-    -kernel build/arm-rtems7-xilinx_zynq_a9_qemu/sattrack_controller.exe
+    -kernel build/arm-rtems7-realview_pbx_a9_qemu/sattrack_controller.exe

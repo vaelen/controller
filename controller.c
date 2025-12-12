@@ -19,9 +19,11 @@
 #include <rtems.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -35,15 +37,37 @@
 
 #define MAX_SATELLITES 32
 
+// ============================================================================
+// Logging Configuration
+// ============================================================================
+
+#define LOG_MSG_MAX_LEN     128
+
+typedef enum {
+    LOG_LEVEL_DEBUG = 0,
+    LOG_LEVEL_INFO  = 1,
+    LOG_LEVEL_WARN  = 2,
+    LOG_LEVEL_ERROR = 3
+} log_level_t;
+
+static log_level_t g_log_level = LOG_LEVEL_INFO;
+static rtems_id g_log_mutex;
+
+// ============================================================================
 // Serial Device Configuration
+// ============================================================================
+
 #define GPS_DEVICE_PATH       "/dev/ttyS1"
 #define GPS_BAUD_RATE         B9600
+#define GPS_FLOW_CONTROL      false
 
 #define ROTATOR_DEVICE_PATH   "/dev/ttyS2"
 #define ROTATOR_BAUD_RATE     B9600
+#define ROTATOR_FLOW_CONTROL  false
 
 #define RADIO_DEVICE_PATH     "/dev/ttyS3"
 #define RADIO_BAUD_RATE       B9600
+#define RADIO_FLOW_CONTROL    false
 
 // ============================================================================
 // Message Types
@@ -166,45 +190,114 @@ static rtems_id g_tle_task_id;
 static rtems_id g_pass_task_id;
 static rtems_id g_pass_executor_task_id;
 static rtems_id g_controller_task_id;
+static rtems_id g_rotator_status_task_id;
+
+// Rotator file descriptor (shared by antenna_location_task and rotator_status_task)
+static int g_rotator_fd = -1;
 
 // ============================================================================
 // Task Priorities and Stack Sizes
 // ============================================================================
 
 #define PRIORITY_CONTROLLER     10
-#define PRIORITY_PASS_EXECUTOR  15
-#define PRIORITY_ANTENNA        20
-#define PRIORITY_GPS            30
+#define PRIORITY_ROTATOR_STATUS 15
+#define PRIORITY_GPS            15
+#define PRIORITY_PASS_EXECUTOR  20
+#define PRIORITY_ANTENNA        30
 #define PRIORITY_PASS           40
 #define PRIORITY_TLE            50
 
 #define TASK_STACK_SIZE     (8 * 1024)
 
 // ============================================================================
+// Logging Functions
+// ============================================================================
+
+/*
+ * Log a formatted message to the console.
+ *
+ * Uses a semaphore to protect printf from concurrent access.
+ * If the log level is below g_log_level, the message is not printed.
+ *
+ * @param level   Log level (DEBUG, INFO, WARN, ERROR)
+ * @param tag     Task identifier (e.g., "GPS", "CTRL")
+ * @param fmt     printf-style format string
+ * @param ...     Format arguments
+ */
+static void log_write(log_level_t level, const char *tag, const char *fmt, ...) {
+    /* Early exit if below threshold */
+    if (level < g_log_level) {
+        return;
+    }
+
+    /* Get level string */
+    const char *level_str;
+    switch (level) {
+        case LOG_LEVEL_DEBUG: level_str = "DEBUG"; break;
+        case LOG_LEVEL_INFO:  level_str = "INFO";  break;
+        case LOG_LEVEL_WARN:  level_str = "WARN";  break;
+        case LOG_LEVEL_ERROR: level_str = "ERROR"; break;
+        default:              level_str = "?";     break;
+    }
+
+    /* Format timestamp (HH:MM:SS if valid, or "??:??:??" if not) */
+    char time_str[12];
+    time_t timestamp = g_state.current_time;
+    if (timestamp > 0) {
+        struct tm *tm = gmtime(&timestamp);
+        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
+                 tm->tm_hour, tm->tm_min, tm->tm_sec);
+    } else {
+        strcpy(time_str, "??:??:??");
+    }
+
+    /* Format user message to fixed buffer */
+    char message[LOG_MSG_MAX_LEN];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    /* Acquire semaphore and print */
+    rtems_semaphore_obtain(g_log_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+    printf("[%s] %-5s [%-7s] %s\n", time_str, level_str, tag, message);
+    rtems_semaphore_release(g_log_mutex);
+}
+
+#define LOG_DEBUG(tag, fmt, ...)  log_write(LOG_LEVEL_DEBUG, tag, fmt, ##__VA_ARGS__)
+#define LOG_INFO(tag, fmt, ...)   log_write(LOG_LEVEL_INFO,  tag, fmt, ##__VA_ARGS__)
+#define LOG_WARN(tag, fmt, ...)   log_write(LOG_LEVEL_WARN,  tag, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(tag, fmt, ...)  log_write(LOG_LEVEL_ERROR, tag, fmt, ##__VA_ARGS__)
+
+// ============================================================================
 // Serial Port Initialization
 // ============================================================================
 
 /*
- * Initialize GPS serial port for non-blocking reads.
- * Returns file descriptor on success, -1 on failure.
+ * Initialize a serial port with the specified settings.
+ *
+ * @param path          Device path (e.g., "/dev/ttyS0")
+ * @param baud          Baud rate (e.g., B9600, B115200)
+ * @param flags         Open flags (O_RDONLY, O_WRONLY, or O_RDWR)
+ * @param flow_control  Enable CTS/RTS hardware flow control
+ * @return              File descriptor on success, -1 on failure
  */
-static int gps_init_serial(void) {
-    int fd = open(GPS_DEVICE_PATH, O_RDWR | O_NOCTTY);
+static int serial_init(const char *path, speed_t baud, int flags, bool flow_control) {
+    int fd = open(path, flags | O_NOCTTY);
     if (fd < 0) {
-        printf("[GPS] Failed to open %s\n", GPS_DEVICE_PATH);
+        LOG_ERROR("SERIAL", "Failed to open serial port %s, Error: %s", path, strerror(errno));
         return -1;
     }
 
     struct termios tty;
     if (tcgetattr(fd, &tty) != 0) {
-        printf("[GPS] Failed to get terminal attributes\n");
         close(fd);
         return -1;
     }
 
     /* Set baud rate */
-    cfsetispeed(&tty, GPS_BAUD_RATE);
-    cfsetospeed(&tty, GPS_BAUD_RATE);
+    cfsetispeed(&tty, baud);
+    cfsetospeed(&tty, baud);
 
     /* 8N1 mode */
     tty.c_cflag &= ~PARENB;        /* No parity */
@@ -212,32 +305,58 @@ static int gps_init_serial(void) {
     tty.c_cflag &= ~CSIZE;
     tty.c_cflag |= CS8;            /* 8 data bits */
 
-    /* No hardware flow control */
-    tty.c_cflag &= ~CRTSCTS;
+    /* Hardware flow control */
+    if (flow_control) {
+        tty.c_cflag |= CRTSCTS;
+    } else {
+        tty.c_cflag &= ~CRTSCTS;
+    }
 
-    /* Enable receiver, ignore modem control lines */
-    tty.c_cflag |= CREAD | CLOCAL;
+    /* Ignore modem control lines */
+    tty.c_cflag |= CLOCAL;
 
-    /* Raw input mode */
-    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    /* Enable receiver if reading */
+    if ((flags & O_RDONLY) || (flags & O_RDWR)) {
+        tty.c_cflag |= CREAD;
 
-    /* No software flow control */
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+        /* Raw input mode */
+        tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+
+        /* No software flow control */
+        tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+
+        /* Non-blocking: return immediately even with no data */
+        tty.c_cc[VMIN] = 0;
+        tty.c_cc[VTIME] = 0;
+    }
 
     /* Raw output mode */
     tty.c_oflag &= ~OPOST;
 
-    /* Non-blocking: return immediately even with no data */
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 0;
-
     if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        printf("[GPS] Failed to set terminal attributes\n");
         close(fd);
         return -1;
     }
 
     return fd;
+}
+
+/*
+ * Initialize the GPS serial port for NMEA input.
+ * Returns file descriptor on success, -1 on failure.
+ */
+static int gps_init(void) {
+    return serial_init(GPS_DEVICE_PATH, GPS_BAUD_RATE,
+                       O_RDONLY, GPS_FLOW_CONTROL);
+}
+
+/*
+ * Initialize the rotator serial port for GS-232A communication.
+ * Returns file descriptor on success, -1 on failure.
+ */
+static int rotator_init(void) {
+    return serial_init(ROTATOR_DEVICE_PATH, ROTATOR_BAUD_RATE,
+                       O_RDWR, ROTATOR_FLOW_CONTROL);
 }
 
 // ============================================================================
@@ -253,15 +372,15 @@ static int gps_init_serial(void) {
  */
 rtems_task gps_task(rtems_task_argument arg) {
     (void)arg;
-    printf("[GPS] Task started\n");
+    LOG_INFO("GPS", "Task started");
 
-    int fd = gps_init_serial();
+    int fd = gps_init();
     if (fd < 0) {
-        printf("[GPS] Serial init failed, task exiting\n");
+        LOG_ERROR("GPS", "Failed to open GPS port %s", GPS_DEVICE_PATH);
         rtems_task_exit();
     }
 
-    printf("[GPS] Serial port %s opened successfully\n", GPS_DEVICE_PATH);
+    LOG_INFO("GPS", "Serial port %s opened successfully", GPS_DEVICE_PATH);
 
     nmea_buffer_t nmea_buf;
     nmea_buffer_init(&nmea_buf);
@@ -332,24 +451,100 @@ rtems_task gps_task(rtems_task_argument arg) {
 /*
  * Antenna Location Task
  *
- * Communicates with the antenna rotator via UART to read current position.
- * Polls the rotator periodically (every few seconds).
- * Reports position to controller via message queue.
+ * Sends periodic position query commands to the antenna rotator.
+ * Uses GS-232A protocol: "C2\r" requests azimuth and elevation.
+ * The rotator_status_task handles parsing responses.
  */
 rtems_task antenna_location_task(rtems_task_argument arg) {
     (void)arg;
-    printf("[ANTENNA] Location task started\n");
+    LOG_INFO("ANTENNA", "Location task started");
 
     while (true) {
-        // TODO: Acquire g_uart1_mutex before UART access
-        // TODO: Send query command to rotator via UART1
-        // TODO: Read response with current az/el
-        // TODO: Release g_uart1_mutex
-        // TODO: Parse response to get azimuth and elevation
-        // TODO: Send antenna_position_message_t to g_antenna_queue
+        // Acquire mutex before UART access
+        rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
 
-        // Stub: simulate periodic position read
+        // Send C2 query command to rotator
+        if (g_rotator_fd >= 0) {
+            const char *cmd = "C2\r";
+            write(g_rotator_fd, cmd, 3);
+        }
+
+        rtems_semaphore_release(g_uart1_mutex);
+
+        // Poll every 2 seconds
         rtems_task_wake_after(2 * rtems_clock_get_ticks_per_second());
+    }
+}
+
+/*
+ * Rotator Status Task
+ *
+ * Listens for status responses from the rotator (GS-232A protocol).
+ * Parses "+0aaa+0eee\r" format (azimuth first, then elevation).
+ * Sends antenna_position_message_t to controller via message queue.
+ */
+rtems_task rotator_status_task(rtems_task_argument arg) {
+    (void)arg;
+    LOG_INFO("ROTATOR", "Status task started");
+
+    char buf[32];
+    int buf_pos = 0;
+
+    while (true) {
+        // Acquire mutex before UART access
+        rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+        // Non-blocking read from rotator
+        if (g_rotator_fd >= 0) {
+            char read_buf[16];
+            ssize_t n = read(g_rotator_fd, read_buf, sizeof(read_buf) - 1);
+            if (n > 0) {
+                // Append to buffer
+                for (ssize_t i = 0; i < n && buf_pos < (int)sizeof(buf) - 1; i++) {
+                    buf[buf_pos++] = read_buf[i];
+                }
+                buf[buf_pos] = '\0';
+            }
+        }
+
+        rtems_semaphore_release(g_uart1_mutex);
+
+        // Check for complete response (ends with CR)
+        char *cr = strchr(buf, '\r');
+        if (cr != NULL) {
+            *cr = '\0';  // Null-terminate at CR
+
+            // Parse GS-232A format: +0aaa+0eee or +0aaa +0eee
+            // Example: +0180+0045 or +0180 +0045 = 180 deg az, 45 deg el
+            int az_deg = 0, el_deg = 0;
+            if (sscanf(buf, "+0%3d +0%3d", &az_deg, &el_deg) == 2 ||
+                sscanf(buf, "+0%3d+0%3d", &az_deg, &el_deg) == 2 ||
+                sscanf(buf, "%d %d", &az_deg, &el_deg) == 2 ||
+                sscanf(buf, "%d%d", &az_deg, &el_deg) == 2) {
+
+                // Convert degrees to radians and send message
+                antenna_position_message_t msg;
+                msg.type = MSG_ANTENNA_POSITION;
+                msg.azimuth = (double)az_deg * SGP4_DEG_TO_RAD;
+                msg.elevation = (double)el_deg * SGP4_DEG_TO_RAD;
+
+                rtems_message_queue_send(g_antenna_queue, &msg, sizeof(msg));
+                LOG_DEBUG("ROTATOR", "Position: az=%d el=%d deg", az_deg, el_deg);
+            }
+
+            // Reset buffer (shift remaining data if any)
+            int remaining = buf_pos - (int)(cr - buf) - 1;
+            if (remaining > 0) {
+                memmove(buf, cr + 1, remaining);
+                buf_pos = remaining;
+            } else {
+                buf_pos = 0;
+            }
+            buf[buf_pos] = '\0';
+        }
+
+        // Yield to other tasks (poll at ~20 Hz)
+        rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(50));
     }
 }
 
@@ -362,7 +557,7 @@ rtems_task antenna_location_task(rtems_task_argument arg) {
  */
 rtems_task tle_updater_task(rtems_task_argument arg) {
     (void)arg;
-    printf("[TLE] Updater task started\n");
+    LOG_INFO("TLE", "Updater task started");
 
     while (true) {
         // TODO: Fetch TLE data from source (network, file, etc.)
@@ -385,10 +580,10 @@ rtems_task tle_updater_task(rtems_task_argument arg) {
  */
 rtems_task pass_calculator_task(rtems_task_argument arg) {
     (void)arg;
-    printf("[PASS] Calculator task started\n");
+    LOG_INFO("PASS", "Calculator task started");
 
     while (true) {
-        // TODO: Acquire g_state_mutex to read observer location
+        // TODO: Acquire g_state_mutex to read observer locationz
         // TODO: Acquire g_tle_database_mutex to read TLE database
         // TODO: For each satellite in database:
         //       - Propagate satellite position
@@ -410,7 +605,7 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
  */
 rtems_task pass_executor_task(rtems_task_argument arg) {
     (void)arg;
-    printf("[EXEC] Pass executor task started\n");
+    LOG_INFO("EXEC", "Pass executor task started");
 
     while (true) {
         // TODO: Wait for pass execution command from controller
@@ -440,17 +635,73 @@ rtems_task pass_executor_task(rtems_task_argument arg) {
  */
 rtems_task controller_task(rtems_task_argument arg) {
     (void)arg;
-    printf("[CTRL] Controller task started\n");
+
+    LOG_INFO("CTRL", "Controller task started");
 
     while (true) {
-        // TODO: Check g_gps_queue for GPS updates (non-blocking)
-        //       - Update observer location and time in g_state
-        // TODO: Check g_antenna_queue for position updates (non-blocking)
-        //       - Update antenna position in g_state
-        // TODO: Check g_tle_queue for TLE database updates (non-blocking)
-        //       - Trigger pass recalculation if needed
-        // TODO: Check g_pass_queue for upcoming passes (non-blocking)
-        //       - Schedule pass execution
+        // Check GPS queue for updates
+        {
+            gps_message_t gps_msg;
+            size_t gps_size;
+            while (rtems_message_queue_receive(g_gps_queue, &gps_msg, &gps_size,
+                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
+                LOG_INFO("CTRL", "GPS: lat=%.6f lon=%.6f alt=%.3f km",
+                         gps_msg.location.lat_rad * SGP4_RAD_TO_DEG,
+                         gps_msg.location.lon_rad * SGP4_RAD_TO_DEG,
+                         gps_msg.location.alt_km);
+
+                // Update shared state
+                rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+                g_state.observer_location = gps_msg.location;
+                g_state.location_valid = true;
+                g_state.current_time = gps_msg.utc_time;
+                g_state.time_valid = true;
+                rtems_semaphore_release(g_state_mutex);
+            }
+        }
+
+        // Check antenna queue for position updates
+        {
+            antenna_position_message_t ant_msg;
+            size_t ant_size;
+            while (rtems_message_queue_receive(g_antenna_queue, &ant_msg, &ant_size,
+                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
+                LOG_INFO("CTRL", "Antenna: az=%.1f el=%.1f deg",
+                         ant_msg.azimuth * SGP4_RAD_TO_DEG,
+                         ant_msg.elevation * SGP4_RAD_TO_DEG);
+
+                // Update shared state
+                rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+                g_state.antenna_azimuth = ant_msg.azimuth;
+                g_state.antenna_elevation = ant_msg.elevation;
+                g_state.antenna_position_valid = true;
+                rtems_semaphore_release(g_state_mutex);
+            }
+        }
+
+        // Check TLE queue for database update notifications
+        {
+            tle_update_message_t tle_msg;
+            size_t tle_size;
+            while (rtems_message_queue_receive(g_tle_queue, &tle_msg, &tle_size,
+                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
+                LOG_INFO("CTRL", "TLE database updated");
+                // TODO: Trigger pass recalculation if needed
+            }
+        }
+
+        // Check pass queue for upcoming pass predictions
+        {
+            pass_message_t pass_msg;
+            size_t pass_size;
+            while (rtems_message_queue_receive(g_pass_queue, &pass_msg, &pass_size,
+                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
+                LOG_INFO("CTRL", "Pass: NORAD %d, max_el=%.1f deg",
+                         pass_msg.pass.norad_id,
+                         pass_msg.pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                // TODO: Schedule pass execution
+            }
+        }
 
         // TODO: If a pass is currently active:
         //       - Calculate current look angles to satellite
@@ -458,7 +709,7 @@ rtems_task controller_task(rtems_task_argument arg) {
         //       - Send antenna command via UART1
         //       - Release g_uart1_mutex
 
-        // Stub: simulate main control loop at 10 Hz
+        // Main control loop at 10 Hz
         rtems_task_wake_after(rtems_clock_get_ticks_per_second() / 10);
     }
 }
@@ -479,7 +730,7 @@ static rtems_status_code create_message_queues(void) {
         &g_gps_queue
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create GPS queue: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create GPS queue: %d", status);
         return status;
     }
 
@@ -492,7 +743,7 @@ static rtems_status_code create_message_queues(void) {
         &g_antenna_queue
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create antenna queue: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create antenna queue: %d", status);
         return status;
     }
 
@@ -505,7 +756,7 @@ static rtems_status_code create_message_queues(void) {
         &g_tle_queue
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create TLE queue: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create TLE queue: %d", status);
         return status;
     }
 
@@ -518,11 +769,31 @@ static rtems_status_code create_message_queues(void) {
         &g_pass_queue
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create pass queue: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create pass queue: %d", status);
         return status;
     }
 
-    printf("Message queues created successfully\n");
+    LOG_INFO("INIT", "Message queues created successfully");
+    return RTEMS_SUCCESSFUL;
+}
+
+static rtems_status_code init_logging(void) {
+    rtems_status_code status;
+
+    // Create log mutex
+    status = rtems_semaphore_create(
+        rtems_build_name('L', 'O', 'G', 'M'),
+        1,  // initially available
+        RTEMS_BINARY_SEMAPHORE | RTEMS_PRIORITY | RTEMS_INHERIT_PRIORITY,
+        0,
+        &g_log_mutex
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        printf("FATAL: Failed to create log mutex: %d\n", status);
+        return status;
+    }
+
+    LOG_INFO("INIT", "Logging initialized");
     return RTEMS_SUCCESSFUL;
 }
 
@@ -538,7 +809,7 @@ static rtems_status_code create_semaphores(void) {
         &g_uart1_mutex
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create UART1 mutex: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create UART1 mutex: %d", status);
         return status;
     }
 
@@ -551,7 +822,7 @@ static rtems_status_code create_semaphores(void) {
         &g_tle_database_mutex
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create TLE database mutex: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create TLE database mutex: %d", status);
         return status;
     }
 
@@ -564,11 +835,11 @@ static rtems_status_code create_semaphores(void) {
         &g_state_mutex
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create state mutex: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create state mutex: %d", status);
         return status;
     }
 
-    printf("Semaphores created successfully\n");
+    LOG_INFO("INIT", "Semaphores created successfully");
     return RTEMS_SUCCESSFUL;
 }
 
@@ -585,7 +856,7 @@ static rtems_status_code create_and_start_tasks(void) {
         &g_gps_task_id
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create GPS task: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create GPS task: %d", status);
         return status;
     }
 
@@ -599,7 +870,27 @@ static rtems_status_code create_and_start_tasks(void) {
         &g_antenna_task_id
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create antenna task: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create antenna task: %d", status);
+        return status;
+    }
+
+    // Open rotator serial port (shared by antenna and rotator status tasks)
+    g_rotator_fd = rotator_init();
+    if (g_rotator_fd < 0) {
+        LOG_WARN("INIT", "Failed to open rotator port %s", ROTATOR_DEVICE_PATH);
+    }
+
+    // Create Rotator Status task
+    status = rtems_task_create(
+        rtems_build_name('R', 'O', 'T', 'S'),
+        PRIORITY_ROTATOR_STATUS,
+        TASK_STACK_SIZE,
+        RTEMS_DEFAULT_MODES,
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_rotator_status_task_id
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create rotator status task: %d", status);
         return status;
     }
 
@@ -613,7 +904,7 @@ static rtems_status_code create_and_start_tasks(void) {
         &g_tle_task_id
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create TLE task: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create TLE task: %d", status);
         return status;
     }
 
@@ -627,7 +918,7 @@ static rtems_status_code create_and_start_tasks(void) {
         &g_pass_task_id
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create pass calculator task: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create pass calculator task: %d", status);
         return status;
     }
 
@@ -641,7 +932,7 @@ static rtems_status_code create_and_start_tasks(void) {
         &g_pass_executor_task_id
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create pass executor task: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create pass executor task: %d", status);
         return status;
     }
 
@@ -655,17 +946,20 @@ static rtems_status_code create_and_start_tasks(void) {
         &g_controller_task_id
     );
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create controller task: %d\n", status);
+        LOG_ERROR("INIT", "Failed to create controller task: %d", status);
         return status;
     }
 
-    printf("Tasks created successfully\n");
+    LOG_INFO("INIT", "Tasks created successfully");
 
     // Start all tasks
     status = rtems_task_start(g_gps_task_id, gps_task, 0);
     if (status != RTEMS_SUCCESSFUL) return status;
 
     status = rtems_task_start(g_antenna_task_id, antenna_location_task, 0);
+    if (status != RTEMS_SUCCESSFUL) return status;
+
+    status = rtems_task_start(g_rotator_status_task_id, rotator_status_task, 0);
     if (status != RTEMS_SUCCESSFUL) return status;
 
     status = rtems_task_start(g_tle_task_id, tle_updater_task, 0);
@@ -680,7 +974,7 @@ static rtems_status_code create_and_start_tasks(void) {
     status = rtems_task_start(g_controller_task_id, controller_task, 0);
     if (status != RTEMS_SUCCESSFUL) return status;
 
-    printf("All tasks started successfully\n");
+    LOG_INFO("INIT", "All tasks started successfully");
     return RTEMS_SUCCESSFUL;
 }
 
@@ -692,8 +986,7 @@ rtems_task Init(rtems_task_argument ignored) {
     (void)ignored;
     rtems_status_code status;
 
-    printf("\n*** SATELLITE TRACKING CONTROLLER ***\n");
-    printf("Initializing...\n");
+    printf("\n*** GROUNDSTATION CONTROLLER ***\n");
 
     // Initialize shared state
     memset(&g_state, 0, sizeof(g_state));
@@ -702,28 +995,34 @@ rtems_task Init(rtems_task_argument ignored) {
     g_state.antenna_position_valid = false;
     g_state.satellite_count = 0;
 
-    // Create IPC objects
-    status = create_message_queues();
+    // Initialize logging
+    status = init_logging();
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create message queues\n");
+        printf("FATAL: Failed to initialize logging\n");
         exit(1);
     }
 
+    // Create IPC objects
     status = create_semaphores();
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create semaphores\n");
+        LOG_ERROR("INIT", "Failed to create semaphores");
+        exit(1);
+    }
+
+    status = create_message_queues();
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create message queues");
         exit(1);
     }
 
     // Create and start all tasks
     status = create_and_start_tasks();
     if (status != RTEMS_SUCCESSFUL) {
-        printf("Failed to create/start tasks\n");
+        LOG_ERROR("INIT", "Failed to create/start tasks");
         exit(1);
     }
 
-    printf("Initialization complete. Tasks running.\n");
-    printf("*** CONTROLLER ACTIVE ***\n\n");
+    LOG_INFO("INIT", "Initialization complete. Tasks running.");
 
     // Init task can now exit - other tasks will continue running
     // In a real application, you might want to keep this task alive

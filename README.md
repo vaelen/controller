@@ -62,7 +62,7 @@ The executable is built at `build/arm-rtems7-xilinx_zynq_a9_qemu/sattrack_contro
 
 This runs the controller in QEMU with:
 
-- `/dev/ttyS0` -> stdio (console)
+- `/dev/ttyS0` -> stdio (console/log output)
 - `/dev/ttyS1` -> `/dev/ttyUSB0` (GPS receiver)
 - `/dev/ttyS2` -> `/dev/ttyUSB1` (rotator)
 - `/dev/ttyS3` -> `/dev/ttyUSB2` (radio)
@@ -81,8 +81,17 @@ Key constants in `controller.c`:
 
 ```c
 #define GPS_DEVICE_PATH       "/dev/ttyS1"
+#define GPS_BAUD_RATE         B9600
+#define GPS_FLOW_CONTROL      false
+
 #define ROTATOR_DEVICE_PATH   "/dev/ttyS2"
+#define ROTATOR_BAUD_RATE     B9600
+#define ROTATOR_FLOW_CONTROL  false
+
 #define RADIO_DEVICE_PATH     "/dev/ttyS3"
+#define RADIO_BAUD_RATE       B9600
+#define RADIO_FLOW_CONTROL    false
+
 #define MAX_SATELLITES        32
 ```
 
