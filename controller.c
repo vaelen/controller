@@ -9,7 +9,11 @@
  *   - Antenna Location Task: Polls antenna rotator position periodically
  *   - TLE Updater Task: Updates TLE database periodically
  *   - Pass Calculator Task: Calculates upcoming satellite passes
+ *   - Pass Executor Task: Controls rotator and radio during satellite passes
  *   - Controller Task: Coordinates passes and commands antenna
+ *
+ * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * SPDX-License-Identifier: MIT
  */
 
 #include <rtems.h>
@@ -18,14 +22,28 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
 
 #include "sgp4.h"
+#include "nmea.h"
 
 // ============================================================================
 // Configuration Constants
 // ============================================================================
 
 #define MAX_SATELLITES 32
+
+// Serial Device Configuration
+#define GPS_DEVICE_PATH       "/dev/ttyS1"
+#define GPS_BAUD_RATE         B9600
+
+#define ROTATOR_DEVICE_PATH   "/dev/ttyS2"
+#define ROTATOR_BAUD_RATE     B9600
+
+#define RADIO_DEVICE_PATH     "/dev/ttyS3"
+#define RADIO_BAUD_RATE       B9600
 
 // ============================================================================
 // Message Types
@@ -146,19 +164,81 @@ static rtems_id g_gps_task_id;
 static rtems_id g_antenna_task_id;
 static rtems_id g_tle_task_id;
 static rtems_id g_pass_task_id;
+static rtems_id g_pass_executor_task_id;
 static rtems_id g_controller_task_id;
 
 // ============================================================================
 // Task Priorities and Stack Sizes
 // ============================================================================
 
-#define PRIORITY_CONTROLLER 10
-#define PRIORITY_ANTENNA    20
-#define PRIORITY_GPS        30
-#define PRIORITY_PASS       40
-#define PRIORITY_TLE        50
+#define PRIORITY_CONTROLLER     10
+#define PRIORITY_PASS_EXECUTOR  15
+#define PRIORITY_ANTENNA        20
+#define PRIORITY_GPS            30
+#define PRIORITY_PASS           40
+#define PRIORITY_TLE            50
 
 #define TASK_STACK_SIZE     (8 * 1024)
+
+// ============================================================================
+// Serial Port Initialization
+// ============================================================================
+
+/*
+ * Initialize GPS serial port for non-blocking reads.
+ * Returns file descriptor on success, -1 on failure.
+ */
+static int gps_init_serial(void) {
+    int fd = open(GPS_DEVICE_PATH, O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        printf("[GPS] Failed to open %s\n", GPS_DEVICE_PATH);
+        return -1;
+    }
+
+    struct termios tty;
+    if (tcgetattr(fd, &tty) != 0) {
+        printf("[GPS] Failed to get terminal attributes\n");
+        close(fd);
+        return -1;
+    }
+
+    /* Set baud rate */
+    cfsetispeed(&tty, GPS_BAUD_RATE);
+    cfsetospeed(&tty, GPS_BAUD_RATE);
+
+    /* 8N1 mode */
+    tty.c_cflag &= ~PARENB;        /* No parity */
+    tty.c_cflag &= ~CSTOPB;        /* 1 stop bit */
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;            /* 8 data bits */
+
+    /* No hardware flow control */
+    tty.c_cflag &= ~CRTSCTS;
+
+    /* Enable receiver, ignore modem control lines */
+    tty.c_cflag |= CREAD | CLOCAL;
+
+    /* Raw input mode */
+    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+
+    /* No software flow control */
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+
+    /* Raw output mode */
+    tty.c_oflag &= ~OPOST;
+
+    /* Non-blocking: return immediately even with no data */
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+        printf("[GPS] Failed to set terminal attributes\n");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
 
 // ============================================================================
 // Task Entry Points
@@ -168,22 +248,84 @@ static rtems_id g_controller_task_id;
  * GPS Task
  *
  * Receives data from a GPS receiver via UART.
- * Parses NMEA sentences to extract position and time.
+ * Parses NMEA sentences (GGA for position, RMC for date/time).
  * Sends updates to the controller via message queue.
  */
 rtems_task gps_task(rtems_task_argument arg) {
     (void)arg;
     printf("[GPS] Task started\n");
 
-    while (true) {
-        // TODO: Initialize UART0 for GPS receiver
-        // TODO: Read UART data
-        // TODO: Parse NMEA sentences (GGA for position, RMC for time)
-        // TODO: Extract latitude, longitude, altitude, and UTC time
-        // TODO: Send gps_message_t to g_gps_queue
+    int fd = gps_init_serial();
+    if (fd < 0) {
+        printf("[GPS] Serial init failed, task exiting\n");
+        rtems_task_exit();
+    }
 
-        // Stub: simulate periodic GPS update
-        rtems_task_wake_after(rtems_clock_get_ticks_per_second());
+    printf("[GPS] Serial port %s opened successfully\n", GPS_DEVICE_PATH);
+
+    nmea_buffer_t nmea_buf;
+    nmea_buffer_init(&nmea_buf);
+
+    /* Track latest valid data from each sentence type */
+    nmea_gga_t last_gga = {0};
+    nmea_rmc_t last_rmc = {0};
+
+    char read_buf[64];
+    char line[NMEA_BUFFER_SIZE];
+
+    while (true) {
+        /* Non-blocking read from serial */
+        ssize_t n = read(fd, read_buf, sizeof(read_buf) - 1);
+        if (n > 0) {
+            read_buf[n] = '\0';
+            nmea_buffer_add(&nmea_buf, read_buf, (int)n);
+        }
+
+        /* Process complete lines from buffer */
+        while (nmea_buffer_get_line(&nmea_buf, line, sizeof(line))) {
+            /* Validate checksum before parsing */
+            if (!nmea_validate_checksum(line)) {
+                continue;
+            }
+
+            if (nmea_is_gga(line)) {
+                nmea_parse_gga(line, &last_gga);
+            } else if (nmea_is_rmc(line)) {
+                nmea_parse_rmc(line, &last_rmc);
+            }
+
+            /* Send message if we have valid position and date/time */
+            if (last_gga.valid && last_gga.fix_quality > 0 &&
+                last_rmc.valid && last_rmc.date.valid) {
+
+                gps_message_t msg;
+                msg.type = MSG_GPS_UPDATE;
+
+                /* Convert degrees to radians, meters to km */
+                msg.location.lat_rad = last_gga.lat_deg * SGP4_DEG_TO_RAD;
+                msg.location.lon_rad = last_gga.lon_deg * SGP4_DEG_TO_RAD;
+                msg.location.alt_km = last_gga.alt_m / 1000.0;
+
+                /* Build time_t from RMC date + GGA time (UTC) */
+                struct tm tm_time;
+                memset(&tm_time, 0, sizeof(tm_time));
+                tm_time.tm_year = last_rmc.date.year - 1900;
+                tm_time.tm_mon = last_rmc.date.month - 1;
+                tm_time.tm_mday = last_rmc.date.day;
+                tm_time.tm_hour = last_gga.time.hour;
+                tm_time.tm_min = last_gga.time.minute;
+                tm_time.tm_sec = (int)last_gga.time.second;
+                tm_time.tm_isdst = 0;
+
+                /* Use mktime (assumes UTC in RTEMS without timezone config) */
+                msg.utc_time = mktime(&tm_time);
+
+                rtems_message_queue_send(g_gps_queue, &msg, sizeof(msg));
+            }
+        }
+
+        /* Yield to other tasks (poll at ~10 Hz) */
+        rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(100));
     }
 }
 
@@ -256,6 +398,34 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
 
         // Stub: simulate periodic pass calculation (every hour)
         rtems_task_wake_after(60 * 60 * rtems_clock_get_ticks_per_second());
+    }
+}
+
+/*
+ * Pass Executor Task
+ *
+ * Executes satellite passes by controlling the rotator and radio.
+ * Started by the controller when a pass begins.
+ * Communicates with the rotator via UART (ttyS2) and radio via UART (ttyS3).
+ */
+rtems_task pass_executor_task(rtems_task_argument arg) {
+    (void)arg;
+    printf("[EXEC] Pass executor task started\n");
+
+    while (true) {
+        // TODO: Wait for pass execution command from controller
+        // TODO: Open rotator serial port (ROTATOR_DEVICE_PATH)
+        // TODO: Open radio serial port (RADIO_DEVICE_PATH)
+        // TODO: During pass:
+        //       - Calculate current satellite position
+        //       - Send rotator commands to track satellite
+        //       - Configure radio frequency (Doppler correction)
+        //       - Handle data reception/transmission
+        // TODO: Close serial ports when pass completes
+        // TODO: Notify controller of pass completion
+
+        // Stub: wait for pass execution trigger
+        rtems_task_wake_after(rtems_clock_get_ticks_per_second());
     }
 }
 
@@ -461,6 +631,20 @@ static rtems_status_code create_and_start_tasks(void) {
         return status;
     }
 
+    // Create Pass Executor task
+    status = rtems_task_create(
+        rtems_build_name('E', 'X', 'E', 'C'),
+        PRIORITY_PASS_EXECUTOR,
+        TASK_STACK_SIZE,
+        RTEMS_DEFAULT_MODES,
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_pass_executor_task_id
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        printf("Failed to create pass executor task: %d\n", status);
+        return status;
+    }
+
     // Create Controller task
     status = rtems_task_create(
         rtems_build_name('C', 'T', 'R', 'L'),
@@ -488,6 +672,9 @@ static rtems_status_code create_and_start_tasks(void) {
     if (status != RTEMS_SUCCESSFUL) return status;
 
     status = rtems_task_start(g_pass_task_id, pass_calculator_task, 0);
+    if (status != RTEMS_SUCCESSFUL) return status;
+
+    status = rtems_task_start(g_pass_executor_task_id, pass_executor_task, 0);
     if (status != RTEMS_SUCCESSFUL) return status;
 
     status = rtems_task_start(g_controller_task_id, controller_task, 0);

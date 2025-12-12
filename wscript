@@ -34,5 +34,5 @@ def build(bld):
     bld(features = 'c cprogram',
         target = 'sattrack_controller.exe',
         cflags = common_cflags,
-        source = ['init.c', 'controller.c', 'sgp4.c'],)
+        source = ['init.c', 'controller.c', 'sgp4.c', 'nmea.c'],)
 

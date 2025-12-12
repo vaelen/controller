@@ -1,6 +1,10 @@
 /*
  * RTEMS Configuration for Satellite Tracking Controller
+ *
+ * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * SPDX-License-Identifier: MIT
  */
+
 #include <rtems.h>
 #include <bsp.h>
 
@@ -11,7 +15,7 @@ rtems_task Init(rtems_task_argument argument);
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 
-/* Task configuration: Init (1) + GPS + Antenna + TLE + Pass + Controller (5) + system tasks */
+/* Task configuration: Init (1) + GPS + Antenna + TLE + Pass + PassExec + Controller (6) + system tasks */
 #define CONFIGURE_MAXIMUM_TASKS 16
 
 /* Message queue configuration */
