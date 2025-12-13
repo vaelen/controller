@@ -50,7 +50,7 @@ typedef enum {
     LOG_LEVEL_ERROR = 3
 } log_level_t;
 
-static log_level_t g_log_level = LOG_LEVEL_INFO;
+static log_level_t g_log_level = LOG_LEVEL_DEBUG;
 static rtems_id g_log_mutex;
 
 // ============================================================================
@@ -291,6 +291,7 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
 
     struct termios tty;
     if (tcgetattr(fd, &tty) != 0) {
+        LOG_ERROR("SERIAL", "Failed to get attributes for serial port %s, Error: %s", path, strerror(errno));
         close(fd);
         return -1;
     }
@@ -315,15 +316,18 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
     /* Ignore modem control lines */
     tty.c_cflag |= CLOCAL;
 
-    /* Enable receiver if reading */0
-    if ((flags & O_RDONLY) || (flags & O_RDWR)) {
+    /* Enable receiver if reading (O_RDONLY is 0, so check access mode) */
+    int access_mode = flags & O_ACCMODE;
+    if (access_mode == O_RDONLY || access_mode == O_RDWR) {
         tty.c_cflag |= CREAD;
 
         /* Raw input mode */
         tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
 
-        /* No software flow control */
-        tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+        /* Disable input processing that could alter data */
+        tty.c_iflag &= ~(IXON | IXOFF | IXANY);   /* No software flow control */
+        tty.c_iflag &= ~(ICRNL | INLCR | IGNCR);  /* Don't translate CR/LF */
+        tty.c_iflag &= ~(ISTRIP | BRKINT);        /* Don't strip 8th bit, ignore break */
 
         /* Non-blocking: return immediately even with no data */
         tty.c_cc[VMIN] = 0;
@@ -334,6 +338,7 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
     tty.c_oflag &= ~OPOST;
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+        LOG_ERROR("SERIAL", "Failed to set attributes for serial port %s, Error: %s", path, strerror(errno));
         close(fd);
         return -1;
     }
@@ -346,6 +351,7 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
  * Returns file descriptor on success, -1 on failure.
  */
 static int gps_init(void) {
+//    return open(GPS_DEVICE_PATH, O_RDONLY | O_NOCTTY);
     return serial_init(GPS_DEVICE_PATH, GPS_BAUD_RATE,
                        O_RDONLY, GPS_FLOW_CONTROL);
 }
@@ -398,12 +404,12 @@ rtems_task gps_task(rtems_task_argument arg) {
         if (n > 0) {
             read_buf[n] = '\0';
             nmea_buffer_add(&nmea_buf, read_buf, (int)n);
-            }
-
-        LOG_DEBUG("GPS", "Read %zd bytes from GPS", n);
+        }
 
         /* Process complete lines from buffer */
         while (nmea_buffer_get_line(&nmea_buf, line, sizeof(line))) {
+            LOG_DEBUG("GPS", "NMEA: %s", line);
+
             /* Validate checksum before parsing */
             if (!nmea_validate_checksum(line)) {
                 continue;
@@ -667,16 +673,18 @@ rtems_task controller_task(rtems_task_argument arg) {
             antenna_position_message_t ant_msg;
             size_t ant_size;
             while (rtems_message_queue_receive(g_antenna_queue, &ant_msg, &ant_size,
-                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
-                LOG_INFO("CTRL", "Antenna: az=%.1f el=%.1f deg",
-                         ant_msg.azimuth * SGP4_RAD_TO_DEG,
-                         ant_msg.elevation * SGP4_RAD_TO_DEG);
-
+                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {                
                 // Update shared state
                 rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-                g_state.antenna_azimuth = ant_msg.azimuth;
-                g_state.antenna_elevation = ant_msg.elevation;
-                g_state.antenna_position_valid = true;
+                if (!(g_state.antenna_azimuth == ant_msg.azimuth) ||
+                    !(g_state.antenna_elevation == ant_msg.elevation)) {
+                                LOG_INFO("CTRL", "Antenna: az=%.1f el=%.1f deg",
+                         ant_msg.azimuth * SGP4_RAD_TO_DEG,
+                         ant_msg.elevation * SGP4_RAD_TO_DEG);
+                    g_state.antenna_azimuth = ant_msg.azimuth;
+                    g_state.antenna_elevation = ant_msg.elevation;
+                    g_state.antenna_position_valid = true;
+                }
                 rtems_semaphore_release(g_state_mutex);
             }
         }
