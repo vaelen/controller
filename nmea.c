@@ -6,9 +6,11 @@
  */
 
 #include "nmea.h"
+#include "log.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdio.h>
 
 /*
  * Internal helper functions
@@ -136,18 +138,46 @@ void nmea_buffer_init(nmea_buffer_t *buf) {
     }
 }
 
-int nmea_buffer_add(nmea_buffer_t *buf, const char *data, int len) {
-    if (!buf || !data || len <= 0) {
+void nmea_buffer_log_contents(nmea_buffer_t *buf) {
+    if (buf) {
+        char output[NMEA_BUFFER_SIZE * 5];
+        memset(output, 0, sizeof(output));
+        char *p = output;
+        for (int i = 0; i < buf->write_pos; i++) {
+            snprintf(p, 4, "%02X ", (unsigned char)buf->buffer[i]);
+            p += 3;
+        }
+        p[0] = ' ';
+        p[1] = '|';
+        p[2] = ' ';
+        p += 3;
+        for (int i = 0; i < buf->write_pos; i++) {
+            if (isprint((unsigned char)buf->buffer[i])) {
+                p[0] = buf->buffer[i];
+            } else {
+                p[0] = '.';
+            }
+            p ++;
+        }
+        LOG_DEBUG("NMEA", "Pos: %d, Contents: %s",  buf->write_pos, output);
+    }
+}
+
+int nmea_buffer_add(nmea_buffer_t *buf, const char *data) {
+    if (!buf || !data) {
+        LOG_WARN("NMEA", "Invalid arguments to nmea_buffer_add");
         return 0;
     }
 
+    int len = strlen(data);
     int space = NMEA_BUFFER_SIZE - buf->write_pos - 1;
     int to_copy = (len < space) ? len : space;
 
     if (to_copy > 0) {
-        memcpy(&buf->buffer[buf->write_pos], data, to_copy);
+        strncpy(&buf->buffer[buf->write_pos], data, to_copy);
         buf->write_pos += to_copy;
         buf->buffer[buf->write_pos] = '\0';
+        //nmea_buffer_log_contents(buf);
     }
 
     return to_copy;
@@ -155,6 +185,7 @@ int nmea_buffer_add(nmea_buffer_t *buf, const char *data, int len) {
 
 bool nmea_buffer_get_line(nmea_buffer_t *buf, char *line, int max_len) {
     if (!buf || !line || max_len <= 0) {
+        LOG_WARN("NMEA", "Invalid arguments to nmea_buffer_get_line");
         return false;
     }
 

@@ -30,28 +30,13 @@
 
 #include "sgp4.h"
 #include "nmea.h"
+#include "log.h"
 
 // ============================================================================
 // Configuration Constants
 // ============================================================================
 
 #define MAX_SATELLITES 32
-
-// ============================================================================
-// Logging Configuration
-// ============================================================================
-
-#define LOG_MSG_MAX_LEN     128
-
-typedef enum {
-    LOG_LEVEL_DEBUG = 0,
-    LOG_LEVEL_INFO  = 1,
-    LOG_LEVEL_WARN  = 2,
-    LOG_LEVEL_ERROR = 3
-} log_level_t;
-
-static log_level_t g_log_level = LOG_LEVEL_DEBUG;
-static rtems_id g_log_mutex;
 
 // ============================================================================
 // Serial Device Configuration
@@ -210,66 +195,6 @@ static int g_rotator_fd = -1;
 #define TASK_STACK_SIZE     (8 * 1024)
 
 // ============================================================================
-// Logging Functions
-// ============================================================================
-
-/*
- * Log a formatted message to the console.
- *
- * Uses a semaphore to protect printf from concurrent access.
- * If the log level is below g_log_level, the message is not printed.
- *
- * @param level   Log level (DEBUG, INFO, WARN, ERROR)
- * @param tag     Task identifier (e.g., "GPS", "CTRL")
- * @param fmt     printf-style format string
- * @param ...     Format arguments
- */
-static void log_write(log_level_t level, const char *tag, const char *fmt, ...) {
-    /* Early exit if below threshold */
-    if (level < g_log_level) {
-        return;
-    }
-
-    /* Get level string */
-    const char *level_str;
-    switch (level) {
-        case LOG_LEVEL_DEBUG: level_str = "DEBUG"; break;
-        case LOG_LEVEL_INFO:  level_str = "INFO";  break;
-        case LOG_LEVEL_WARN:  level_str = "WARN";  break;
-        case LOG_LEVEL_ERROR: level_str = "ERROR"; break;
-        default:              level_str = "?";     break;
-    }
-
-    /* Format timestamp (HH:MM:SS if valid, or "??:??:??" if not) */
-    char time_str[12];
-    time_t timestamp = g_state.current_time;
-    if (timestamp > 0) {
-        struct tm *tm = gmtime(&timestamp);
-        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
-                 tm->tm_hour, tm->tm_min, tm->tm_sec);
-    } else {
-        strcpy(time_str, "??:??:??");
-    }
-
-    /* Format user message to fixed buffer */
-    char message[LOG_MSG_MAX_LEN];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(message, sizeof(message), fmt, args);
-    va_end(args);
-
-    /* Acquire semaphore and print */
-    rtems_semaphore_obtain(g_log_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-    printf("[%s] %-5s [%-7s] %s\n", time_str, level_str, tag, message);
-    rtems_semaphore_release(g_log_mutex);
-}
-
-#define LOG_DEBUG(tag, fmt, ...)  log_write(LOG_LEVEL_DEBUG, tag, fmt, ##__VA_ARGS__)
-#define LOG_INFO(tag, fmt, ...)   log_write(LOG_LEVEL_INFO,  tag, fmt, ##__VA_ARGS__)
-#define LOG_WARN(tag, fmt, ...)   log_write(LOG_LEVEL_WARN,  tag, fmt, ##__VA_ARGS__)
-#define LOG_ERROR(tag, fmt, ...)  log_write(LOG_LEVEL_ERROR, tag, fmt, ##__VA_ARGS__)
-
-// ============================================================================
 // Serial Port Initialization
 // ============================================================================
 
@@ -400,10 +325,14 @@ rtems_task gps_task(rtems_task_argument arg) {
 
     while (true) {
         /* Non-blocking read from serial */
-        ssize_t n = read(fd, read_buf, sizeof(read_buf) - 1);
-        if (n > 0) {
+        ssize_t n;
+        n = read(fd, read_buf, sizeof(read_buf) - 1);
+        while (n > 0) {
             read_buf[n] = '\0';
-            nmea_buffer_add(&nmea_buf, read_buf, (int)n);
+            nmea_buffer_add(&nmea_buf, read_buf);
+            // For some reason, non-blocking read always reads only 1 byte at a time
+            // even if more bytes are available. Keep reading until no more data.
+            n = read(fd, read_buf, sizeof(read_buf) - 1);
         }
 
         /* Process complete lines from buffer */
@@ -653,18 +582,43 @@ rtems_task controller_task(rtems_task_argument arg) {
             size_t gps_size;
             while (rtems_message_queue_receive(g_gps_queue, &gps_msg, &gps_size,
                                                RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
-                LOG_INFO("CTRL", "GPS: lat=%.6f lon=%.6f alt=%.3f km",
-                         gps_msg.location.lat_rad * SGP4_RAD_TO_DEG,
-                         gps_msg.location.lon_rad * SGP4_RAD_TO_DEG,
-                         gps_msg.location.alt_km);
-
+       
                 // Update shared state
                 rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+                bool log_location = !g_state.location_valid ||
+                    g_state.observer_location.lat_rad != gps_msg.location.lat_rad ||
+                    g_state.observer_location.lon_rad != gps_msg.location.lon_rad ||
+                    g_state.observer_location.alt_km != gps_msg.location.alt_km;
+
+                bool log_time = !g_state.time_valid;
+
                 g_state.observer_location = gps_msg.location;
                 g_state.location_valid = true;
                 g_state.current_time = gps_msg.utc_time;
                 g_state.time_valid = true;
                 rtems_semaphore_release(g_state_mutex);
+
+                // Update log timestamp
+                log_set_time(gps_msg.utc_time);
+
+                if (log_location) {
+                    LOG_INFO("CTRL", "GPS: lat=%.6f deg lon=%.6f deg alt=%.2f km",
+                             gps_msg.location.lat_rad * SGP4_RAD_TO_DEG,
+                             gps_msg.location.lon_rad * SGP4_RAD_TO_DEG,
+                             gps_msg.location.alt_km);
+                }
+
+                if (log_time) {
+                    struct tm *tm_utc = gmtime(&gps_msg.utc_time);
+                    LOG_INFO("CTRL", "GPS Time: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                             tm_utc->tm_year + 1900,
+                             tm_utc->tm_mon + 1,
+                             tm_utc->tm_mday,
+                             tm_utc->tm_hour,
+                             tm_utc->tm_min,
+                             tm_utc->tm_sec);
+                }
             }
         }
 
@@ -784,26 +738,6 @@ static rtems_status_code create_message_queues(void) {
     }
 
     LOG_INFO("INIT", "Message queues created successfully");
-    return RTEMS_SUCCESSFUL;
-}
-
-static rtems_status_code init_logging(void) {
-    rtems_status_code status;
-
-    // Create log mutex
-    status = rtems_semaphore_create(
-        rtems_build_name('L', 'O', 'G', 'M'),
-        1,  // initially available
-        RTEMS_BINARY_SEMAPHORE | RTEMS_PRIORITY | RTEMS_INHERIT_PRIORITY,
-        0,
-        &g_log_mutex
-    );
-    if (status != RTEMS_SUCCESSFUL) {
-        printf("FATAL: Failed to create log mutex: %d\n", status);
-        return status;
-    }
-
-    LOG_INFO("INIT", "Logging initialized");
     return RTEMS_SUCCESSFUL;
 }
 
@@ -1006,7 +940,7 @@ rtems_task Init(rtems_task_argument ignored) {
     g_state.satellite_count = 0;
 
     // Initialize logging
-    status = init_logging();
+    status = log_init();
     if (status != RTEMS_SUCCESSFUL) {
         printf("FATAL: Failed to initialize logging\n");
         exit(1);

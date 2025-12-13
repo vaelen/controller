@@ -67,8 +67,8 @@ typedef struct {
 /* Initialize buffer to empty state */
 void nmea_buffer_init(nmea_buffer_t *buf);
 
-/* Add data to buffer. Returns number of bytes added. */
-int nmea_buffer_add(nmea_buffer_t *buf, const char *data, int len);
+/* Add null-terminated string to buffer. Returns number of bytes added. */
+int nmea_buffer_add(nmea_buffer_t *buf, const char *data);
 
 /* Extract a complete line from buffer (ending with \n).
  * Returns true if a line was extracted, false if no complete line available.
