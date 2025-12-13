@@ -1,6 +1,6 @@
-# Satellite Tracking Controller
+# Satellite Groundstation Controller
 
-An RTEMS-based satellite tracking controller that coordinates GPS positioning, TLE database management, pass prediction, and antenna control for automated satellite tracking.
+An RTEMS-based satellite groundstation controller that coordinates GPS positioning, TLE database management, pass prediction, and antenna control for automated satellite tracking.
 
 ## Overview
 
@@ -74,6 +74,28 @@ This runs the controller in QEMU with:
 - Radio with serial control interface
 
 An emulator for these devices can be created using a Pi Pico, ESP32, or STM32 microcontroller using the [serial-device-emulator](https://github.com/vaelen/serial-device-emulator) firmware.
+
+## Example Log Output
+
+```txt
+*** GROUNDSTATION CONTROLLER ***
+[??:??:??] INFO  [LOG    ] Logging initialized
+[??:??:??] INFO  [INIT   ] Semaphores created successfully
+[??:??:??] INFO  [INIT   ] Message queues created successfully
+[??:??:??] INFO  [INIT   ] Tasks created successfully
+[??:??:??] INFO  [INIT   ] All tasks started successfully
+[??:??:??] INFO  [INIT   ] Initialization complete. Tasks running.
+[??:??:??] INFO  [CTRL   ] Controller task started
+[??:??:??] INFO  [GPS    ] Task started
+[??:??:??] INFO  [GPS    ] Serial port /dev/ttyS1 opened successfully
+[??:??:??] INFO  [ROTATOR] Status task started
+[??:??:??] INFO  [EXEC   ] Pass executor task started
+[??:??:??] INFO  [ANTENNA] Location task started
+[??:??:??] INFO  [PASS   ] Calculator task started
+[??:??:??] INFO  [TLE    ] Updater task started
+[03:31:43] INFO  [CTRL   ] GPS: lat=35.587078 deg lon=139.490148 deg alt=0.08 km
+[03:31:43] INFO  [CTRL   ] GPS Time: 2025-12-13 03:31:43 UTC
+```
 
 ## Configuration
 
