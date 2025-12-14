@@ -32,7 +32,7 @@ def build(bld):
 
     # Main application
     bld(features = 'c cprogram',
-        target = 'sattrack_controller.exe',
+        target = 'controller.exe',
         cflags = common_cflags,
         source = ['init.c', 'controller.c', 'log.c', 'sgp4.c', 'nmea.c'],)
 
