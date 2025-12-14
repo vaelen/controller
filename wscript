@@ -31,8 +31,10 @@ def build(bld):
     common_cflags = '-g -O2'
 
     # Main application
+    # Note: console-config.c must be listed first to override the BSP's console configuration
     bld(features = 'c cprogram',
         target = 'controller.exe',
         cflags = common_cflags,
-        source = ['init.c', 'controller.c', 'log.c', 'sgp4.c', 'nmea.c'],)
+        linkflags = ['-Wl,--allow-multiple-definition'],
+        source = ['console-config.c', 'init.c', 'controller.c', 'log.c', 'sgp4.c', 'nmea.c'],)
 
