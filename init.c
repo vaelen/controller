@@ -11,8 +11,10 @@
 /* Forward declaration */
 rtems_task Init(rtems_task_argument argument);
 
-/* Clock and console drivers */
+/* Clock driver - required for task scheduling */
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
+
+/* Console driver */
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 
 /* Task configuration: Init (1) + GPS + Antenna + TLE + Pass + PassExec + Controller (6) + system tasks */

@@ -17,6 +17,7 @@
  */
 
 #include <rtems.h>
+#include <bsp.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -31,6 +32,10 @@
 #include "sgp4.h"
 #include "nmea.h"
 #include "log.h"
+
+#ifdef IS_AM335X
+#include "bbb.c"
+#endif
 
 // ============================================================================
 // Configuration Constants
@@ -930,6 +935,12 @@ rtems_task Init(rtems_task_argument ignored) {
     rtems_status_code status;
 
     printf("\n*** GROUNDSTATION CONTROLLER ***\n");
+
+    // Initialize UARTs
+#ifdef IS_AM335X
+    configure_uart_pins();
+    enable_uart_clocks();
+#endif
 
     // Initialize shared state
     memset(&g_state, 0, sizeof(g_state));

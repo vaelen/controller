@@ -27,15 +27,25 @@ git submodule update rtems_waf
 ./waf clean
 ```
 
-The executable is built at `build/arm-rtems7-xilinx_zynq_a9_qemu/sattrack_controller.exe`.
+The executable is built at `build/arm-rtems7-<bsp>/controller.exe` (e.g., `build/arm-rtems7-beagleboneblack/controller.exe`).
 
 ## Running
 
+### BeagleBone Black (Hardware)
+
 ```bash
-./run.sh
+./deploy.sh --build
 ```
 
-Runs the controller in QEMU with the first serial port connected to `/dev/ttyUSB0` (GPS) and the second to stdio (console).
+Builds the project and deploys to the TFTP server at `/srv/tftp/controller.img`. Reset the BeagleBone Black to boot via TFTP. See README.md for TFTP setup instructions.
+
+### QEMU Emulation
+
+```bash
+./run-emulator.sh
+```
+
+Runs the controller in QEMU with simulated serial ports for GPS, rotator, and radio.
 
 ## Architecture Overview
 
