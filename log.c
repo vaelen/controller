@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <string.h>
 
 // ============================================================================
@@ -17,7 +18,7 @@
 
 static log_level_t g_log_level = LOG_LEVEL_INFO;
 static rtems_id g_log_mutex;
-static time_t g_log_time = 0;
+static bool g_clock_valid = false;
 
 // ============================================================================
 // Logging Functions
@@ -43,7 +44,32 @@ rtems_status_code log_init(void) {
 }
 
 void log_set_time(time_t utc_time) {
-    g_log_time = utc_time;
+    struct tm *tm = gmtime(&utc_time);
+    if (tm == NULL) {
+        return;
+    }
+
+    int year = tm->tm_year + 1900;
+    if (year < 2020 || year > 2100) {
+        return;
+    }
+
+    rtems_time_of_day tod;
+    tod.year   = (uint32_t)year;
+    tod.month  = (uint32_t)(tm->tm_mon + 1);
+    tod.day    = (uint32_t)tm->tm_mday;
+    tod.hour   = (uint32_t)tm->tm_hour;
+    tod.minute = (uint32_t)tm->tm_min;
+    tod.second = (uint32_t)tm->tm_sec;
+    tod.ticks  = 0;
+
+    if (rtems_clock_set(&tod) == RTEMS_SUCCESSFUL) {
+        g_clock_valid = true;
+    }
+}
+
+bool log_clock_is_valid(void) {
+    return g_clock_valid;
 }
 
 void log_set_level(log_level_t level) {
@@ -66,12 +92,16 @@ void log_write(log_level_t level, const char *tag, const char *fmt, ...) {
         default:              level_str = "?";     break;
     }
 
-    /* Format timestamp (HH:MM:SS if valid, or "??:??:??" if not) */
+    /* Format timestamp (HH:MM:SS if clock valid, or "??:??:??" if not) */
     char time_str[12];
-    if (g_log_time > 0) {
-        struct tm *tm = gmtime(&g_log_time);
-        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
-                 tm->tm_hour, tm->tm_min, tm->tm_sec);
+    if (g_clock_valid) {
+        rtems_time_of_day tod;
+        if (rtems_clock_get_tod(&tod) == RTEMS_SUCCESSFUL) {
+            snprintf(time_str, sizeof(time_str), "%02u:%02u:%02u",
+                     (unsigned)tod.hour, (unsigned)tod.minute, (unsigned)tod.second);
+        } else {
+            strcpy(time_str, "??:??:??");
+        }
     } else {
         strcpy(time_str, "??:??:??");
     }

@@ -58,7 +58,7 @@
 // Message Types
 // ============================================================================
 
-typedef enum {
+typedef enum message_type {
     MSG_GPS_UPDATE,
     MSG_TLE_DATABASE_UPDATED,
     MSG_PASS_CALCULATED,
@@ -67,7 +67,7 @@ typedef enum {
 } message_type_t;
 
 // Pass information structure
-typedef struct {
+typedef struct pass_info {
     int norad_id;
     double aos_jd;           // Acquisition of signal (Julian Date)
     double los_jd;           // Loss of signal (Julian Date)
@@ -77,39 +77,39 @@ typedef struct {
 } pass_info_t;
 
 // GPS position and time update message
-typedef struct {
+typedef struct gps_message {
     message_type_t type;
     sgp4_geodetic_t location;
     time_t utc_time;
 } gps_message_t;
 
 // Antenna current position message
-typedef struct {
+typedef struct antenna_position_message {
     message_type_t type;
     double azimuth;    // radians
     double elevation;  // radians
 } antenna_position_message_t;
 
 // Antenna command message
-typedef struct {
+typedef struct antenna_command_message {
     message_type_t type;
     double target_azimuth;    // radians
     double target_elevation;  // radians
 } antenna_command_message_t;
 
 // Pass notification message
-typedef struct {
+typedef struct pass_message {
     message_type_t type;
     pass_info_t pass;
 } pass_message_t;
 
 // TLE update notification (simple flag)
-typedef struct {
+typedef struct tle_update_message {
     message_type_t type;
 } tle_update_message_t;
 
 // Union of all message types for queue sizing
-typedef union {
+typedef union controller_message {
     message_type_t type;
     gps_message_t gps;
     antenna_position_message_t antenna_pos;
@@ -122,7 +122,7 @@ typedef union {
 // Satellite entry for TLE database
 // ============================================================================
 
-typedef struct {
+typedef struct satellite_entry {
     bool valid;
     sgp4_tle_t tle;
     sgp4_state_t state;
@@ -132,7 +132,7 @@ typedef struct {
 // Shared State (protected by mutexes)
 // ============================================================================
 
-typedef struct {
+typedef struct controller_state {
     // Observer location from GPS
     sgp4_geodetic_t observer_location;
     bool location_valid;
@@ -184,13 +184,13 @@ static int g_rotator_fd = -1;
 // Task Priorities and Stack Sizes
 // ============================================================================
 
-#define PRIORITY_CONTROLLER     10
-#define PRIORITY_ROTATOR_STATUS 15
-#define PRIORITY_GPS            15
-#define PRIORITY_PASS_EXECUTOR  20
-#define PRIORITY_ANTENNA        30
-#define PRIORITY_PASS           40
-#define PRIORITY_TLE            50
+#define PRIORITY_PASS_EXECUTOR  10
+#define PRIORITY_CONTROLLER     20
+#define PRIORITY_ROTATOR_STATUS 30
+#define PRIORITY_ANTENNA        40
+#define PRIORITY_GPS            50
+#define PRIORITY_PASS           60
+#define PRIORITY_TLE            70
 
 #define TASK_STACK_SIZE     (8 * 1024)
 
@@ -276,7 +276,6 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
  * Returns file descriptor on success, -1 on failure.
  */
 static int gps_init(void) {
-//    return open(GPS_DEVICE_PATH, O_RDONLY | O_NOCTTY);
     return serial_init(GPS_DEVICE_PATH, GPS_BAUD_RATE,
                        O_RDONLY, GPS_FLOW_CONTROL);
 }

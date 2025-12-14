@@ -9,6 +9,7 @@
 #define LOG_H
 
 #include <rtems.h>
+#include <stdbool.h>
 #include <time.h>
 
 // ============================================================================
@@ -39,14 +40,27 @@ typedef enum {
 rtems_status_code log_init(void);
 
 /*
- * Set the current time for log timestamps.
+ * Set the RTEMS system clock from GPS time.
  *
- * Call this whenever the system time is updated (e.g., from GPS).
- * If never called, log timestamps will show "??:??:??".
+ * This sets CLOCK_REALTIME via rtems_clock_set(). Once set, the clock
+ * continues to advance automatically via the RTEMS clock driver.
+ * Log timestamps will use rtems_clock_get_tod() to read current time.
  *
- * @param utc_time  Current UTC time
+ * Invalid times (year < 2020 or > 2100) are rejected silently.
+ *
+ * @param utc_time  Current UTC time from GPS
  */
 void log_set_time(time_t utc_time);
+
+/*
+ * Check if the system clock has been set.
+ *
+ * Returns true if log_set_time() has successfully set the RTEMS clock
+ * at least once (i.e., valid GPS time has been received).
+ *
+ * @return true if clock is valid, false otherwise
+ */
+bool log_clock_is_valid(void);
 
 /*
  * Set the minimum log level.
