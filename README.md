@@ -227,6 +227,26 @@ This runs the controller in QEMU with:
 
 An emulator for these devices can be created using a Pi Pico, ESP32, or STM32 microcontroller using the [serial-device-emulator](https://github.com/vaelen/serial-device-emulator) firmware.
 
+### BeagleBone Black Pin Assignments
+
+The following table shows the physical P9 header pins used for each UART:
+
+| Device  | UART  | Function | Pin   | Ball Name      | Mux Mode |
+|---------|-------|----------|-------|----------------|----------|
+| Console | UART0 | —        | J1    | (debug header) | —        |
+| GPS     | UART1 | RXD      | P9.26 | uart1_rxd      | 0        |
+| GPS     | UART1 | TXD      | P9.24 | uart1_txd      | 0        |
+| Rotator | UART2 | RXD      | P9.22 | spi0_sclk      | 1        |
+| Rotator | UART2 | TXD      | P9.21 | spi0_d0        | 1        |
+| Radio   | UART4 | RXD      | P9.11 | gpmc_wait0     | 6        |
+| Radio   | UART4 | TXD      | P9.13 | gpmc_wpn       | 6        |
+
+**Notes:**
+- UART0 is the debug console, directly accessible via the J1 serial header
+- UART3 is not used (pins conflict with other functions)
+- UART4 is mapped to `/dev/ttyS3` in software
+- Pin muxing is configured in `console-config.c`
+
 ## Example Log Output
 
 ```txt

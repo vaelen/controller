@@ -18,6 +18,23 @@
 #include <rtems/bspIo.h>
 #include <bsp/irq.h>
 
+
+/* ============================================================================
+ * UART Base Addresses and IRQs
+ * ============================================================================ */
+
+/* AM335x UART base addresses */
+#define AM335X_UART0_BASE   0x44E09000  /* Console */
+#define AM335X_UART1_BASE   0x48022000  /* GPS - /dev/ttyS1 */
+#define AM335X_UART2_BASE   0x48024000  /* Rotator - /dev/ttyS2 */
+#define AM335X_UART4_BASE   0x481A8000  /* Radio - /dev/ttyS3 */
+
+/* AM335x UART IRQ numbers */
+#define AM335X_UART0_IRQ    72
+#define AM335X_UART1_IRQ    73
+#define AM335X_UART2_IRQ    74
+#define AM335X_UART4_IRQ    45
+
 /* ============================================================================
  * Pin Mux Configuration
  * ============================================================================ */
@@ -104,6 +121,37 @@ static void enable_uart_clocks(void) {
     *reg = MODULEMODE_ENABLE;
 }
 
+/* ============================================================================
+ * UART Mode Configuration
+ * ============================================================================ */
+
+/*
+ * The AM335x UARTs are TI OMAP-style UARTs that are not standard NS16550 compatible, 
+ * they have an additional MDR1 (Mode Definition Register 1) that the standard NS16550
+ * driver doesn't know about. 
+ * 
+ * MDR1 defaults to 0x07 (UART disabled). Until you set MDR1 to 0x00 (16x UART mode), 
+ * the UART will not function properly. Writes will block waiting for the transmitter, 
+ * and reads won't receive data.
+*/
+
+/* AM335x UART MDR1 register offset (from UART base) */
+#define UART_OMAP_MDR1_OFFSET    0x20  /* Register offset in 32-bit mode */
+
+/* MDR1 mode values */
+#define UART_OMAP_MDR1_16X_MODE  0x00  /* UART 16x mode - normal operation */
+#define UART_OMAP_MDR1_DISABLE   0x07  /* Disabled (default after reset) */
+
+static void configure_uart_mode(uintptr_t uart_base) {
+    volatile uint32_t *mdr1 = (volatile uint32_t *)(uart_base + UART_OMAP_MDR1_OFFSET);
+    
+    /* Disable UART first (required before changing settings) */
+    *mdr1 = UART_OMAP_MDR1_DISABLE;
+    
+    /* Enable UART in 16x mode */
+    *mdr1 = UART_OMAP_MDR1_16X_MODE;
+}
+
 /*
  * Initialize UART hardware before the console driver runs.
  * Called automatically via RTEMS_SYSINIT_ITEM.
@@ -111,6 +159,11 @@ static void enable_uart_clocks(void) {
 static void uart_hardware_init(void) {
     enable_uart_clocks();
     configure_uart_pins();
+
+    /* Configure OMAP UART mode registers */
+    configure_uart_mode(AM335X_UART1_BASE);
+    configure_uart_mode(AM335X_UART2_BASE);
+    configure_uart_mode(AM335X_UART4_BASE);
 }
 
 RTEMS_SYSINIT_ITEM(
@@ -122,18 +175,6 @@ RTEMS_SYSINIT_ITEM(
 /* ============================================================================
  * Console Driver Configuration
  * ============================================================================ */
-
-/* AM335x UART base addresses */
-#define AM335X_UART0_BASE   0x44E09000  /* Console */
-#define AM335X_UART1_BASE   0x48022000  /* GPS - /dev/ttyS1 */
-#define AM335X_UART2_BASE   0x48024000  /* Rotator - /dev/ttyS2 */
-#define AM335X_UART4_BASE   0x481A8000  /* Radio - /dev/ttyS3 */
-
-/* AM335x UART IRQ numbers */
-#define AM335X_UART0_IRQ    72
-#define AM335X_UART1_IRQ    73
-#define AM335X_UART2_IRQ    74
-#define AM335X_UART4_IRQ    45
 
 /* Console baud rate - must match BSP */
 #ifndef CONSOLE_BAUD
@@ -159,7 +200,7 @@ static void beagle_uart_set_register(uintptr_t addr, uint8_t i, uint8_t val)
  *   /dev/ttyS0 - UART0 (Console, 115200 baud)
  *   /dev/ttyS1 - UART1 (GPS, 9600 baud)
  *   /dev/ttyS2 - UART2 (Rotator, 9600 baud)
- *   /dev/ttyS3 - UART4 (Radio, 9600 baud)
+ *   /dev/ttyS3 - UART4 (Radio, 38400 baud)
  */
 console_tbl Console_Configuration_Ports[] = {
     /* UART0 - Console */
@@ -214,7 +255,7 @@ console_tbl Console_Configuration_Ports[] = {
         .pDeviceFns = &ns16550_fns,
         .ulMargin = 16,
         .ulHysteresis = 8,
-        .pDeviceParams = (void *)9600,
+        .pDeviceParams = (void *)38400,
         .ulCtrlPort1 = AM335X_UART4_BASE,
         .ulDataPort = AM335X_UART4_BASE,
         .ulIntVector = AM335X_UART4_IRQ,

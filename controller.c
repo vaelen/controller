@@ -209,7 +209,7 @@ static int g_rotator_fd = -1;
  * @return              File descriptor on success, -1 on failure
  */
 static int serial_init(const char *path, speed_t baud, int flags, bool flow_control) {
-    int fd = open(path, flags | O_NOCTTY);
+    int fd = open(path, flags | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
         LOG_ERROR("SERIAL", "Failed to open serial port %s, Error: %s", path, strerror(errno));
         return -1;
@@ -278,7 +278,7 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
  */
 static int gps_init(void) {
     return serial_init(GPS_DEVICE_PATH, GPS_BAUD_RATE,
-                       O_RDONLY, GPS_FLOW_CONTROL);
+                       O_RDWR, GPS_FLOW_CONTROL);
 }
 
 /*
@@ -330,14 +330,16 @@ rtems_task gps_task(rtems_task_argument arg) {
         while (n > 0) {
             read_buf[n] = '\0';
             nmea_buffer_add(&nmea_buf, read_buf);
-            // For some reason, non-blocking read always reads only 1 byte at a time
-            // even if more bytes are available. Keep reading until no more data.
             n = read(fd, read_buf, sizeof(read_buf) - 1);
         }
 
         /* Process complete lines from buffer */
         while (nmea_buffer_get_line(&nmea_buf, line, sizeof(line))) {
-            LOG_DEBUG("GPS", "NMEA: %s", line);
+            /* Strip trailing newline/carriage return */
+            while(line[strlen(line)-1] == '\n' || line[strlen(line)-1] == '\r') {
+                line[strlen(line)-1] = '\0';
+            }
+            // LOG_DEBUG("GPS", "NMEA: %s", line);
 
             /* Validate checksum before parsing */
             if (!nmea_validate_checksum(line)) {
@@ -345,8 +347,10 @@ rtems_task gps_task(rtems_task_argument arg) {
             }
 
             if (nmea_is_gga(line)) {
+                LOG_DEBUG("GPS", "NMEA GGA: %s", line);
                 nmea_parse_gga(line, &last_gga);
             } else if (nmea_is_rmc(line)) {
+                LOG_DEBUG("GPS", "NMEA RMC: %s", line);
                 nmea_parse_rmc(line, &last_rmc);
             }
 
@@ -397,6 +401,7 @@ rtems_task antenna_location_task(rtems_task_argument arg) {
     LOG_INFO("ANTENNA", "Location task started");
 
     while (true) {
+
         // Acquire mutex before UART access
         rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
 
@@ -404,6 +409,8 @@ rtems_task antenna_location_task(rtems_task_argument arg) {
         if (g_rotator_fd >= 0) {
             const char *cmd = "C2\r";
             write(g_rotator_fd, cmd, 3);
+            fsync(g_rotator_fd);
+            LOG_DEBUG("ROTATOR", "Sent command: %s", cmd);
         }
 
         rtems_semaphore_release(g_uart1_mutex);
@@ -434,17 +441,28 @@ rtems_task rotator_status_task(rtems_task_argument arg) {
         // Non-blocking read from rotator
         if (g_rotator_fd >= 0) {
             char read_buf[16];
+            ssize_t total_read = 0;
             ssize_t n = read(g_rotator_fd, read_buf, sizeof(read_buf) - 1);
-            if (n > 0) {
+            while (n > 0) {
+                total_read += n;
                 // Append to buffer
                 for (ssize_t i = 0; i < n && buf_pos < (int)sizeof(buf) - 1; i++) {
                     buf[buf_pos++] = read_buf[i];
                 }
                 buf[buf_pos] = '\0';
+                n = read(g_rotator_fd, read_buf, sizeof(read_buf) - 1);
             }
+            if (total_read > 0)
+                LOG_DEBUG("ROTATOR", "Read %zd bytes from rotator", total_read);
         }
 
         rtems_semaphore_release(g_uart1_mutex);
+
+        if (buf_pos == 0) {
+            // No data received, yield and continue
+            rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(50));
+            continue;
+        }
 
         // Check for complete response (ends with CR)
         char *cr = strchr(buf, '\r');
