@@ -16,7 +16,7 @@
 // Module State
 // ============================================================================
 
-static log_level_t g_log_level = LOG_LEVEL_DEBUG;
+static log_level_t g_log_level = LOG_LEVEL_INFO;
 static rtems_id g_log_mutex;
 static bool g_clock_valid = false;
 

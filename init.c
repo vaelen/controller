@@ -17,15 +17,16 @@ rtems_task Init(rtems_task_argument argument);
 /* Console driver */
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 
-/* Task configuration: Init (1) + GPS + Antenna + TLE + Pass + PassExec + Controller (6) + system tasks */
-#define CONFIGURE_MAXIMUM_TASKS 16
+/* Task configuration: Init (1) + GPS + Antenna + RotatorStatus + RadioFreq + RadioStatus + TLE + Pass + PassExec + Controller + Status (10) + system tasks */
+#define CONFIGURE_MAXIMUM_TASKS 20
 
-/* Message queue configuration (5 app queues + 1 log queue) */
-#define CONFIGURE_MAXIMUM_MESSAGE_QUEUES 6
-#define CONFIGURE_MESSAGE_BUFFER_MEMORY (12 * 1024)
+/* Message queue configuration (6 app queues + 1 log queue + radio queue) */
+/* pass_message_t is ~2.7KB with 64-step plan, pass queue holds 4 messages = ~11KB */
+#define CONFIGURE_MAXIMUM_MESSAGE_QUEUES 8
+#define CONFIGURE_MESSAGE_BUFFER_MEMORY (48 * 1024)
 
-/* Semaphore configuration for mutexes */
-#define CONFIGURE_MAXIMUM_SEMAPHORES 5
+/* Semaphore configuration for mutexes (UART1, UART3, TLE, State, Log, spare) */
+#define CONFIGURE_MAXIMUM_SEMAPHORES 8
 
 /* File descriptor configuration: stdin/stdout/stderr (3) + GPS + Rotator + Radio + spare */
 #define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 16
