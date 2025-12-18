@@ -257,16 +257,29 @@ The following table shows the physical P9 header pins used for each UART:
 [??:??:??] INFO  [INIT   ] Tasks created successfully
 [??:??:??] INFO  [INIT   ] All tasks started successfully
 [??:??:??] INFO  [INIT   ] Initialization complete. Tasks running.
+[??:??:??] INFO  [EXEC   ] Pass executor task started
 [??:??:??] INFO  [CTRL   ] Controller task started
+[??:??:??] INFO  [ROTATOR] Status task started
+[??:??:??] INFO  [RADIO  ] Status task started
+[??:??:??] INFO  [RADIO  ] Frequency task started
+[??:??:??] INFO  [ANTENNA] Location task started
 [??:??:??] INFO  [GPS    ] Task started
 [??:??:??] INFO  [GPS    ] Serial port /dev/ttyS1 opened successfully
-[??:??:??] INFO  [ROTATOR] Status task started
-[??:??:??] INFO  [EXEC   ] Pass executor task started
-[??:??:??] INFO  [ANTENNA] Location task started
 [??:??:??] INFO  [PASS   ] Calculator task started
 [??:??:??] INFO  [TLE    ] Updater task started
-[03:31:43] INFO  [CTRL   ] GPS: lat=35.587078 deg lon=139.490148 deg alt=0.08 km
-[03:31:43] INFO  [CTRL   ] GPS Time: 2025-12-13 03:31:43 UTC
+[??:??:??] INFO  [STATUS ] Status task started
+[??:??:??] INFO  [CTRL   ] Antenna: az=0.0 el=0.0 deg
+[??:??:??] INFO  [CTRL   ] Radio: connected
+[??:??:??] INFO  [CTRL   ] Radio: VFO-A=14.074000 MHz VFO-B=7.074000 MHz
+[09:29:42] INFO  [CTRL   ] GPS: lat=35.587182 deg lon=139.490050 deg alt=0.05 km
+[09:29:42] INFO  [CTRL   ] GPS Time: 2025-12-18 09:29:42 UTC
+[09:30:11] INFO  [STATUS ] === System Status ===
+[09:30:11] INFO  [STATUS ] GPS Time: 2025-12-18 09:30:11 UTC
+[09:30:11] INFO  [STATUS ] GPS Pos: 35.587182, 139.490050, 52m
+[09:30:11] INFO  [STATUS ] Antenna: az=0.0 el=0.0 deg
+[09:30:11] INFO  [STATUS ] Radio: VFO-A active, mode=???, preamp=IPO
+[09:30:11] INFO  [STATUS ] Radio: VFO-A=14.074000 MHz, VFO-B=7.074000 MHz
+[09:30:11] INFO  [STATUS ] TLE: 0 satellites loaded
 ```
 
 ## Configuration
@@ -283,7 +296,7 @@ Key constants in `controller.c`:
 #define ROTATOR_FLOW_CONTROL  false
 
 #define RADIO_DEVICE_PATH     "/dev/ttyS3"
-#define RADIO_BAUD_RATE       B9600
+#define RADIO_BAUD_RATE       B38400
 #define RADIO_FLOW_CONTROL    false
 
 #define MAX_SATELLITES        32
