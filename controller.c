@@ -1010,7 +1010,8 @@ rtems_task controller_task(rtems_task_argument arg) {
                                                RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {                
                 // Update shared state
                 rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-                if (!(g_state.antenna_azimuth == ant_msg.azimuth) ||
+                if (!g_state.antenna_position_valid || 
+                    !(g_state.antenna_azimuth == ant_msg.azimuth) ||
                     !(g_state.antenna_elevation == ant_msg.elevation)) {
                                 LOG_INFO("CTRL", "Antenna: az=%.1f el=%.1f deg",
                          ant_msg.azimuth * SGP4_RAD_TO_DEG,
