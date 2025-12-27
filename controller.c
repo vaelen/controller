@@ -32,28 +32,25 @@
 #include "sgp4.h"
 #include "nmea.h"
 #include "log.h"
+#include "config.h"
+
+#include <sys/stat.h>
+#include <rtems/dosfs.h>
+#include <rtems/libio.h>
+
+/* libbsd for SD card support */
+#include <machine/rtems-bsd-commands.h>
+#include <rtems/bsd/bsd.h>
+#include <rtems/bdbuf.h>
+#include <rtems/media.h>
+#include <rtems/rtemsmmcsd.h>
+#include <rtems/bdpart.h>
 
 // ============================================================================
 // Configuration Constants
 // ============================================================================
 
 #define MAX_SATELLITES 32
-
-// ============================================================================
-// Serial Device Configuration
-// ============================================================================
-
-#define GPS_DEVICE_PATH       "/dev/ttyS1"
-#define GPS_BAUD_RATE         B9600
-#define GPS_FLOW_CONTROL      false
-
-#define ROTATOR_DEVICE_PATH   "/dev/ttyS2"
-#define ROTATOR_BAUD_RATE     B9600
-#define ROTATOR_FLOW_CONTROL  false
-
-#define RADIO_DEVICE_PATH     "/dev/ttyS3"
-#define RADIO_BAUD_RATE       B38400
-#define RADIO_FLOW_CONTROL    false
 
 // ============================================================================
 // Message Types
@@ -65,7 +62,8 @@ typedef enum message_type {
     MSG_PASS_CALCULATED,
     MSG_ANTENNA_POSITION,
     MSG_COMMAND_ANTENNA,
-    MSG_RADIO_STATUS
+    MSG_RADIO_STATUS,
+    MSG_CONFIG_RELOAD
 } message_type_t;
 
 // Radio operating mode enum (Yaesu FT-991A CAT protocol)
@@ -184,6 +182,11 @@ typedef union controller_message {
     tle_update_message_t tle_update;
 } controller_message_t;
 
+// Controller command message (for config reload, etc.)
+typedef struct ctrl_cmd_message {
+    message_type_t type;
+} ctrl_cmd_message_t;
+
 // ============================================================================
 // Satellite entry for TLE database
 // ============================================================================
@@ -263,6 +266,9 @@ static rtems_id g_uart3_mutex;
 static rtems_id g_radio_status_task_id;
 static rtems_id g_radio_freq_task_id;
 static int g_radio_fd = -1;
+
+// Controller command queue (for config reload, etc.)
+static rtems_id g_ctrl_cmd_queue;
 
 // Status task
 static rtems_id g_status_task_id;
@@ -362,30 +368,249 @@ static int serial_init(const char *path, speed_t baud, int flags, bool flow_cont
 }
 
 /*
- * Initialize the GPS serial port for NMEA input.
+ * Initialize a serial port from configuration.
  * Returns file descriptor on success, -1 on failure.
  */
-static int gps_init(void) {
-    return serial_init(GPS_DEVICE_PATH, GPS_BAUD_RATE,
-                       O_RDWR, GPS_FLOW_CONTROL);
+static int serial_init_from_config(const serial_config_t *cfg) {
+    return serial_init(cfg->device_path, cfg->baud_rate,
+                       O_RDWR, cfg->flow_control);
+}
+
+#include <dirent.h>
+
+/*
+ * List contents of a directory for debugging purposes.
+ */
+static void list_directory(const char *path) {
+    DIR *dir = opendir(path);
+    if (dir == NULL) {
+        LOG_INFO("INIT", "Cannot open %s: %s", path, strerror(errno));
+        return;
+    }
+
+    LOG_INFO("INIT", "Contents of %s:", path);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;  /* Skip . and .. */
+        LOG_INFO("INIT", "  %s", entry->d_name);
+    }
+    closedir(dir);
 }
 
 /*
- * Initialize the rotator serial port for GS-232A communication.
- * Returns file descriptor on success, -1 on failure.
+ * Initialize libbsd and wait for SD card device.
+ * Returns true on success, false on failure.
  */
-static int rotator_init(void) {
-    return serial_init(ROTATOR_DEVICE_PATH, ROTATOR_BAUD_RATE,
-                       O_RDWR, ROTATOR_FLOW_CONTROL);
+static bool libbsd_init(void) {
+    rtems_status_code sc;
+
+    LOG_INFO("INIT", "Initializing block device buffer...");
+
+    /* Initialize block device buffer - required for disk I/O */
+    sc = rtems_bdbuf_init();
+    if (sc != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to initialize bdbuf: %d", sc);
+        return false;
+    }
+
+    LOG_INFO("INIT", "Initializing media manager...");
+
+    /* Initialize media manager - handles partition discovery */
+    sc = rtems_media_initialize();
+    if (sc != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to initialize media: %d", sc);
+        return false;
+    }
+
+    /* Start media server for automatic partition handling */
+    sc = rtems_media_server_initialize(
+        200,                      /* Priority */
+        32 * 1024,               /* Stack size */
+        RTEMS_DEFAULT_MODES,
+        RTEMS_DEFAULT_ATTRIBUTES
+    );
+    if (sc != RTEMS_SUCCESSFUL) {
+        LOG_WARN("INIT", "Failed to start media server: %d (continuing anyway)", sc);
+    }
+
+    /*
+     * Configure mmcsd driver to use media server for device attach.
+     * This enables automatic partition discovery (creates /dev/mmcsd0s1, etc.)
+     * Must be called BEFORE rtems_bsd_initialize().
+     */
+    LOG_INFO("INIT", "Configuring mmcsd for media server attach...");
+    rtems_mmcsd_use_media_server();
+
+    LOG_INFO("INIT", "Initializing libbsd...");
+
+    /* Initialize the libbsd library */
+    sc = rtems_bsd_initialize();
+    if (sc != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to initialize libbsd: %d", sc);
+        return false;
+    }
+
+    /*
+     * Wait for the SD card device to appear (up to 5 seconds).
+     * The device name depends on how the driver attaches:
+     * - Static attach: /dev/mmcsd0, /dev/mmcsd0s1
+     * - Media server: /dev/mmcsd-0, /dev/mmcsd-0s1
+     *
+     * The media server processes disk attach asynchronously, then
+     * tries to mount. If mount fails, it runs partition inquiry.
+     * We need to wait for partition devices to appear.
+     */
+    const char *raw_devices[] = {
+        "/dev/mmcsd0",     /* Static attach */
+        "/dev/mmcsd-0",    /* Media server */
+    };
+    const char *partition_devices[] = {
+        "/dev/mmcsd01",    /* Static attach, partition 1 */
+        "/dev/mmcsd-01",   /* Media server, partition 1 (bdpart naming) */
+        "/dev/mmcsd0s1",   /* Static attach, slice 1 */
+        "/dev/mmcsd-0s1",  /* Media server, slice 1 */
+    };
+    int timeout_ms = 5000;
+    int elapsed = 0;
+    bool raw_found = false;
+
+    LOG_INFO("INIT", "Waiting for SD card device...");
+
+    /* First, wait for the raw device to appear */
+    while (elapsed < timeout_ms && !raw_found) {
+        for (int i = 0; i < 2; i++) {
+            struct stat st;
+            if (stat(raw_devices[i], &st) == 0) {
+                LOG_INFO("INIT", "Raw SD card device found: %s", raw_devices[i]);
+                raw_found = true;
+                break;
+            }
+        }
+        if (!raw_found) {
+            rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(100));
+            elapsed += 100;
+        }
+    }
+
+    if (!raw_found) {
+        LOG_WARN("INIT", "SD card device not found after %d ms", timeout_ms);
+        list_directory("/dev");
+        return false;
+    }
+
+    /*
+     * Raw device found. Try to register partitions manually.
+     * The media server may not have completed partition discovery,
+     * so we call rtems_bdpart_register_from_disk directly.
+     */
+    const char *disk_path = NULL;
+    for (int i = 0; i < 2; i++) {
+        struct stat st;
+        if (stat(raw_devices[i], &st) == 0) {
+            disk_path = raw_devices[i];
+            break;
+        }
+    }
+
+    if (disk_path != NULL) {
+        LOG_INFO("INIT", "Registering partitions from %s...", disk_path);
+        rtems_status_code psc = rtems_bdpart_register_from_disk(disk_path);
+        if (psc == RTEMS_SUCCESSFUL) {
+            LOG_INFO("INIT", "Partition registration successful");
+        } else {
+            LOG_WARN("INIT", "Partition registration failed: %d", psc);
+        }
+    }
+
+    /* Wait briefly for partition devices to appear */
+    LOG_INFO("INIT", "Waiting for partition devices...");
+    const int num_partition_devs = sizeof(partition_devices) / sizeof(partition_devices[0]);
+    int partition_timeout = 1000;
+    elapsed = 0;
+
+    while (elapsed < partition_timeout) {
+        for (int i = 0; i < num_partition_devs; i++) {
+            struct stat st;
+            if (stat(partition_devices[i], &st) == 0) {
+                LOG_INFO("INIT", "Partition device found: %s", partition_devices[i]);
+                return true;
+            }
+        }
+        rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(100));
+        elapsed += 100;
+    }
+
+    /* No partition found - maybe it's a superfloppy format (no partition table) */
+    LOG_INFO("INIT", "No partition device found, will try raw device");
+    list_directory("/dev");
+    return true;  /* Return true anyway, mount_sd_card will try both */
 }
 
 /*
- * Initialize the radio serial port for Yaesu CAT communication.
- * Returns file descriptor on success, -1 on failure.
+ * Mount the SD card filesystem.
+ * Creates mount point and mounts FAT filesystem.
+ * Returns true on success, false on failure.
  */
-static int radio_init(void) {
-    return serial_init(RADIO_DEVICE_PATH, RADIO_BAUD_RATE,
-                       O_RDWR, RADIO_FLOW_CONTROL);
+static bool mount_sd_card(void) {
+    int rv;
+
+    /* Create mount point directories */
+    rv = mkdir("/mnt", 0755);
+    if (rv != 0 && errno != EEXIST) {
+        LOG_ERROR("INIT", "Failed to create /mnt: %s", strerror(errno));
+        return false;
+    }
+
+    rv = mkdir(CONFIG_SD_MOUNT, 0755);
+    if (rv != 0 && errno != EEXIST) {
+        LOG_ERROR("INIT", "Failed to create %s: %s", CONFIG_SD_MOUNT, strerror(errno));
+        return false;
+    }
+
+    /*
+     * Try to mount in order of preference:
+     * - Partitions first (most common for SD cards with partition table)
+     * - Raw device last (for superfloppy format without partition table)
+     * Naming depends on attach mode (static vs media server)
+     */
+    const char *devices[] = {
+        "/dev/mmcsd01",    /* Static attach, partition 1 (bdpart) */
+        "/dev/mmcsd-01",   /* Media server, partition 1 (bdpart) */
+        "/dev/mmcsd0s1",   /* Static attach, slice 1 */
+        "/dev/mmcsd-0s1",  /* Media server, slice 1 */
+        "/dev/mmcsd0",     /* Static attach, raw */
+        "/dev/mmcsd-0",    /* Media server, raw */
+    };
+    const int num_devices = sizeof(devices) / sizeof(devices[0]);
+
+    for (int i = 0; i < num_devices; i++) {
+        struct stat st;
+        if (stat(devices[i], &st) != 0) {
+            LOG_DEBUG("INIT", "Device %s not found", devices[i]);
+            continue;
+        }
+
+        LOG_DEBUG("INIT", "Trying to mount %s...", devices[i]);
+
+        rv = mount(
+            devices[i],
+            CONFIG_SD_MOUNT,
+            RTEMS_FILESYSTEM_TYPE_DOSFS,
+            RTEMS_FILESYSTEM_READ_WRITE,
+            NULL
+        );
+
+        if (rv == 0) {
+            LOG_INFO("INIT", "SD card mounted at %s (device: %s)",
+                     CONFIG_SD_MOUNT, devices[i]);
+            return true;
+        }
+
+        LOG_DEBUG("INIT", "Mount %s failed: %s", devices[i], strerror(errno));
+    }
+
+    LOG_WARN("INIT", "Failed to mount SD card: %s", strerror(errno));
+    return false;
 }
 
 // ============================================================================
@@ -403,13 +628,17 @@ rtems_task gps_task(rtems_task_argument arg) {
     (void)arg;
     LOG_INFO("GPS", "Task started");
 
-    int fd = gps_init();
+    /* Get current configuration */
+    config_t cfg;
+    config_get_copy(&cfg);
+
+    int fd = serial_init_from_config(&cfg.gps);
     if (fd < 0) {
-        LOG_ERROR("GPS", "Failed to open GPS port %s", GPS_DEVICE_PATH);
+        LOG_ERROR("GPS", "Failed to open GPS port %s", cfg.gps.device_path);
         rtems_task_exit();
     }
 
-    LOG_INFO("GPS", "Serial port %s opened successfully", GPS_DEVICE_PATH);
+    LOG_INFO("GPS", "Serial port %s opened successfully", cfg.gps.device_path);
 
     nmea_buffer_t nmea_buf;
     nmea_buffer_init(&nmea_buf);
@@ -1106,6 +1335,28 @@ rtems_task controller_task(rtems_task_argument arg) {
             }
         }
 
+        // Check controller command queue (config reload, etc.)
+        {
+            ctrl_cmd_message_t cmd_msg;
+            size_t cmd_size;
+            while (rtems_message_queue_receive(g_ctrl_cmd_queue, &cmd_msg, &cmd_size,
+                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
+                switch (cmd_msg.type) {
+                    case MSG_CONFIG_RELOAD:
+                        LOG_INFO("CTRL", "Config reload requested");
+                        if (config_reload() == CONFIG_SUCCESS) {
+                            LOG_INFO("CTRL", "Configuration reloaded successfully");
+                        } else {
+                            LOG_ERROR("CTRL", "Configuration reload failed");
+                        }
+                        break;
+                    default:
+                        LOG_WARN("CTRL", "Unknown command type: %d", cmd_msg.type);
+                        break;
+                }
+            }
+        }
+
         // TODO: If a pass is currently active:
         //       - Calculate current look angles to satellite
         //       - Acquire g_uart1_mutex
@@ -1186,6 +1437,19 @@ static rtems_status_code create_message_queues(void) {
     );
     if (status != RTEMS_SUCCESSFUL) {
         LOG_ERROR("INIT", "Failed to create radio queue: %d", status);
+        return status;
+    }
+
+    // Controller command queue (for config reload, etc.)
+    status = rtems_message_queue_create(
+        rtems_build_name('C', 'M', 'D', 'Q'),
+        4,
+        sizeof(ctrl_cmd_message_t),
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_ctrl_cmd_queue
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create controller command queue: %d", status);
         return status;
     }
 
@@ -1283,10 +1547,14 @@ static rtems_status_code create_and_start_tasks(void) {
         return status;
     }
 
+    // Get configuration for serial port initialization
+    config_t cfg;
+    config_get_copy(&cfg);
+
     // Open rotator serial port (shared by antenna and rotator status tasks)
-    g_rotator_fd = rotator_init();
+    g_rotator_fd = serial_init_from_config(&cfg.rotator);
     if (g_rotator_fd < 0) {
-        LOG_WARN("INIT", "Failed to open rotator port %s", ROTATOR_DEVICE_PATH);
+        LOG_WARN("INIT", "Failed to open rotator port %s", cfg.rotator.device_path);
     }
 
     // Create Rotator Status task
@@ -1304,9 +1572,9 @@ static rtems_status_code create_and_start_tasks(void) {
     }
 
     // Open radio serial port
-    g_radio_fd = radio_init();
+    g_radio_fd = serial_init_from_config(&cfg.radio);
     if (g_radio_fd < 0) {
-        LOG_WARN("INIT", "Failed to open radio port %s", RADIO_DEVICE_PATH);
+        LOG_WARN("INIT", "Failed to open radio port %s", cfg.radio.device_path);
     }
 
     // Create Radio Frequency task
@@ -1467,6 +1735,18 @@ rtems_task Init(rtems_task_argument ignored) {
     if (status != RTEMS_SUCCESSFUL) {
         printf("FATAL: Failed to initialize logging\n");
         exit(1);
+    }
+
+    // Initialize libbsd (required for SD card driver)
+    if (!libbsd_init()) {
+        LOG_WARN("INIT", "libbsd init failed, SD card not available");
+    } else if (!mount_sd_card()) {
+        LOG_WARN("INIT", "SD card mount failed, using default configuration");
+    }
+
+    status = config_system_init(NULL);
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_WARN("INIT", "Config init failed, using defaults");
     }
 
     // Create IPC objects

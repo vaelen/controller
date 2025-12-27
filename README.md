@@ -284,23 +284,80 @@ The following table shows the physical P9 header pins used for each UART:
 
 ## Configuration
 
-Key constants in `controller.c`:
+The controller reads configuration from an INI-style file on the SD card. If no configuration file exists, a default one is created automatically on first boot.
 
-```c
-#define GPS_DEVICE_PATH       "/dev/ttyS1"
-#define GPS_BAUD_RATE         B9600
-#define GPS_FLOW_CONTROL      false
+### Configuration File Location
 
-#define ROTATOR_DEVICE_PATH   "/dev/ttyS2"
-#define ROTATOR_BAUD_RATE     B9600
-#define ROTATOR_FLOW_CONTROL  false
-
-#define RADIO_DEVICE_PATH     "/dev/ttyS3"
-#define RADIO_BAUD_RATE       B38400
-#define RADIO_FLOW_CONTROL    false
-
-#define MAX_SATELLITES        32
+```text
+/mnt/sd/config.ini
 ```
+
+### Example Configuration
+
+```ini
+; Satellite Tracking Controller Configuration
+
+[serial]
+gps_device = /dev/ttyS1
+gps_baud = 9600
+gps_flow_control = false
+rotator_device = /dev/ttyS2
+rotator_baud = 9600
+rotator_flow_control = false
+radio_device = /dev/ttyS3
+radio_baud = 38400
+radio_flow_control = false
+
+[observer]
+latitude = 35.587182
+longitude = 139.490050
+altitude = 52.0
+
+[files]
+tle_path = /mnt/sd/tle.txt
+
+[system]
+log_level = INFO
+status_interval = 30
+```
+
+### Configuration Sections
+
+| Section      | Key                      | Description                                | Default           |
+|--------------|--------------------------|------------------------------------------- |-------------------|
+| `[serial]`   | `gps_device`             | GPS serial port device path                | `/dev/ttyS1`      |
+|              | `gps_baud`               | GPS baud rate                              | `9600`            |
+|              | `gps_flow_control`       | Enable hardware flow control               | `false`           |
+|              | `rotator_device`         | Rotator serial port device path            | `/dev/ttyS2`      |
+|              | `rotator_baud`           | Rotator baud rate                          | `9600`            |
+|              | `rotator_flow_control`   | Enable hardware flow control               | `false`           |
+|              | `radio_device`           | Radio serial port device path              | `/dev/ttyS3`      |
+|              | `radio_baud`             | Radio baud rate                            | `38400`           |
+|              | `radio_flow_control`     | Enable hardware flow control               | `false`           |
+| `[observer]` | `latitude`               | Observer latitude in degrees (N positive)  | From GPS          |
+|              | `longitude`              | Observer longitude in degrees (E positive) | From GPS          |
+|              | `altitude`               | Observer altitude in meters                | From GPS          |
+| `[files]`    | `tle_path`               | Path to TLE database file                  | `/mnt/sd/tle.txt` |
+| `[system]`   | `log_level`              | Logging level: DEBUG, INFO, WARN, ERROR    | `INFO`            |
+|              | `status_interval`        | Status output interval in seconds          | `30`              |
+
+### Notes
+
+- Comments start with `;` or `#`
+- Boolean values accept: `true`/`false`, `yes`/`no`, `1`/`0`, `on`/`off`
+- If `[observer]` location is not set, GPS-derived location is used
+- Changes to the config file require a reboot to take effect
+- Supported baud rates: 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200
+
+### SD Card Setup
+
+The SD card must be formatted with a FAT filesystem (FAT16 or FAT32). The controller automatically:
+
+1. Mounts the SD card at `/mnt/sd`
+2. Loads `config.ini` if present
+3. Creates a default `config.ini` if none exists
+
+See [sdcard.md](sdcard.md) for technical details on SD card support.
 
 ## File Structure
 

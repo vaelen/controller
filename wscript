@@ -36,5 +36,6 @@ def build(bld):
         target = 'controller.exe',
         cflags = common_cflags,
         linkflags = ['-Wl,--allow-multiple-definition'],
-        source = ['console-config.c', 'init.c', 'controller.c', 'log.c', 'sgp4.c', 'nmea.c'],)
+        lib = ['bsd'],
+        source = ['console-config.c', 'init.c', 'controller.c', 'log.c', 'sgp4.c', 'nmea.c', 'config.c'],)
 
