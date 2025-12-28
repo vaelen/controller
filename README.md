@@ -85,8 +85,6 @@ export PATH=$HOME/rtems/7/bin:$PATH
 
 Choose and build a BSP for your target hardware:
 
-**For BeagleBone Black:**
-
 ```bash
 cd $HOME/rtems/src/rtems
 ./waf bspdefaults --rtems-bsps=arm/beagleboneblack > config.ini
@@ -94,18 +92,6 @@ cd $HOME/rtems/src/rtems
 ./waf
 ./waf install
 ```
-
-**For QEMU (Xilinx Zynq A9):**
-
-```bash
-cd $HOME/rtems/src/rtems
-./waf bspdefaults --rtems-bsps=arm/xilinx_zynq_a9_qemu > config.ini
-./waf configure --prefix=$HOME/rtems/7
-./waf
-./waf install
-```
-
-You can build multiple BSPs by repeating step 5 with different BSP names.
 
 #### 6. Clone and Build rtems-libbsd
 
@@ -141,7 +127,7 @@ For technical details about the BeagleBone Black fixes, see [sdcard.md](sdcard.m
 ls $HOME/rtems/7/arm-rtems7/
 ```
 
-You should see directories for each installed BSP (e.g., `beagleboneblack`, `xilinx_zynq_a9_qemu`).
+You should see a directory for the installed BSP (e.g., `beagleboneblack`).
 
 ### Build Commands
 
@@ -152,9 +138,6 @@ git submodule update rtems_waf
 
 # Configure for BeagleBone Black
 ./waf configure --prefix=$HOME/rtems/7 --rtems-bsps=arm/beagleboneblack
-
-# Or configure for QEMU
-./waf configure --prefix=$HOME/rtems/7 --rtems-bsps=arm/xilinx_zynq_a9_qemu
 
 # Build
 ./waf
@@ -233,19 +216,6 @@ The recommended development workflow uses TFTP boot for fast iteration:
 - **"TFTP error: 'File not found'"**: Run `./deploy.sh` to copy the executable
 - **No network response**: Verify Ethernet cable and IP addresses
 - **U-Boot doesn't read uEnv.txt**: Ensure SD card has FAT32 partition and is inserted
-
-### QEMU Emulation
-
-```bash
-./run-emulator.sh
-```
-
-This runs the controller in QEMU with:
-
-- `/dev/ttyS0` -> stdio (console/log output)
-- `/dev/ttyS1` -> `/dev/ttyUSB0` (GPS receiver)
-- `/dev/ttyS2` -> `/dev/ttyUSB1` (rotator)
-- `/dev/ttyS3` -> `/dev/ttyUSB2` (radio)
 
 ### Hardware Requirements
 
@@ -347,6 +317,13 @@ tle_path = /mnt/sd/tle.txt
 [system]
 log_level = INFO
 status_interval = 30
+
+[network]
+interface = cpsw0
+use_dhcp = true
+ip_address = 192.168.1.100
+netmask = 255.255.255.0
+gateway = 192.168.1.1
 ```
 
 ### Configuration Sections
@@ -362,20 +339,26 @@ status_interval = 30
 |              | `radio_device`           | Radio serial port device path              | `/dev/ttyS3`      |
 |              | `radio_baud`             | Radio baud rate                            | `38400`           |
 |              | `radio_flow_control`     | Enable hardware flow control               | `false`           |
-| `[observer]` | `latitude`               | Observer latitude in degrees (N positive)  | From GPS          |
-|              | `longitude`              | Observer longitude in degrees (E positive) | From GPS          |
-|              | `altitude`               | Observer altitude in meters                | From GPS          |
+| `[observer]` | `latitude`               | Observer latitude in degrees (N positive)  | `0.0`             |
+|              | `longitude`              | Observer longitude in degrees (E positive) | `0.0`             |
+|              | `altitude`               | Observer altitude in meters                | `0.0`             |
 | `[files]`    | `tle_path`               | Path to TLE database file                  | `/mnt/sd/tle.txt` |
 | `[system]`   | `log_level`              | Logging level: DEBUG, INFO, WARN, ERROR    | `INFO`            |
 |              | `status_interval`        | Status output interval in seconds          | `30`              |
+| `[network]`  | `interface`              | Network interface name                     | `cpsw0`           |
+|              | `use_dhcp`               | Use DHCP for network configuration         | `true`            |
+|              | `ip_address`             | Static IP address (if DHCP disabled)       | `192.168.1.100`   |
+|              | `netmask`                | Subnet mask (if DHCP disabled)             | `255.255.255.0`   |
+|              | `gateway`                | Default gateway (if DHCP disabled)         | `192.168.1.1`     |
 
 ### Notes
 
 - Comments start with `;` or `#`
 - Boolean values accept: `true`/`false`, `yes`/`no`, `1`/`0`, `on`/`off`
-- If `[observer]` location is not set, GPS-derived location is used
+- GPS location always overrides `[observer]` settings when a GPS receiver is connected
 - Changes to the config file require a reboot to take effect
 - Supported baud rates: 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200
+- Static IP settings (`ip_address`, `netmask`, `gateway`) are only used when `use_dhcp` is `false`
 
 ### SD Card Setup
 
@@ -398,7 +381,6 @@ sattrack_controller/
 ├── date.h            # Date/time utilities (third-party)
 ├── wscript           # Waf build configuration
 ├── deploy.sh         # Deploy to TFTP server for BBB
-├── run-emulator.sh   # QEMU launch script
 └── docs/
     └── NMEA.md       # NMEA sentence format reference
 ```
