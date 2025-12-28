@@ -46,6 +46,14 @@
 #include <rtems/rtemsmmcsd.h>
 #include <rtems/bdpart.h>
 
+/* Networking support */
+#include <sys/socket.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <rtems/dhcpcd.h>
+
 // ============================================================================
 // Configuration Constants
 // ============================================================================
@@ -614,6 +622,290 @@ static bool mount_sd_card(void) {
 }
 
 // ============================================================================
+// Network Initialization
+// ============================================================================
+
+/*
+ * Wait for network interface to appear.
+ * Returns true if interface is found within timeout.
+ */
+static bool network_wait_for_interface(const char *ifname, int timeout_sec)
+{
+    for (int i = 0; i < timeout_sec; i++) {
+        struct ifaddrs *ifap;
+        if (getifaddrs(&ifap) == 0) {
+            for (struct ifaddrs *ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+                if (strcmp(ifa->ifa_name, ifname) == 0) {
+                    freeifaddrs(ifap);
+                    LOG_INFO("NET", "Interface %s detected", ifname);
+                    return true;
+                }
+            }
+            freeifaddrs(ifap);
+        }
+        rtems_task_wake_after(rtems_clock_get_ticks_per_second());
+    }
+    return false;
+}
+
+/*
+ * Configure static IPv4 address.
+ */
+static void network_configure_ipv4_static(const network_config_t *cfg)
+{
+    char *ifcfg_argv[] = {
+        "ifconfig",
+        (char *)cfg->interface,
+        "inet",
+        (char *)cfg->ipv4.address,
+        "netmask",
+        (char *)cfg->ipv4.netmask,
+        NULL
+    };
+
+    int exit_code = rtems_bsd_command_ifconfig(6, ifcfg_argv);
+    if (exit_code != 0) {
+        LOG_ERROR("NET", "Failed to configure IPv4 address: %d", exit_code);
+        return;
+    }
+
+    LOG_INFO("NET", "IPv4: %s/%s", cfg->ipv4.address, cfg->ipv4.netmask);
+
+    /* Add default gateway if specified */
+    if (cfg->ipv4.gateway[0] != '\0') {
+        char *route_gw_argv[] = {
+            "route",
+            "add",
+            "-host",
+            (char *)cfg->ipv4.gateway,
+            "-iface",
+            (char *)cfg->interface,
+            NULL
+        };
+        char *route_default_argv[] = {
+            "route",
+            "add",
+            "default",
+            (char *)cfg->ipv4.gateway,
+            NULL
+        };
+
+        rtems_bsd_command_route(6, route_gw_argv);
+        rtems_bsd_command_route(4, route_default_argv);
+        LOG_INFO("NET", "IPv4 gateway: %s", cfg->ipv4.gateway);
+    }
+}
+
+/*
+ * Configure static IPv6 address.
+ */
+static void network_configure_ipv6_static(const network_config_t *cfg)
+{
+    char prefix_str[8];
+    snprintf(prefix_str, sizeof(prefix_str), "%d", cfg->ipv6.prefix_len);
+
+    char *ifcfg_argv[] = {
+        "ifconfig",
+        (char *)cfg->interface,
+        "inet6",
+        (char *)cfg->ipv6.address,
+        "prefixlen",
+        prefix_str,
+        NULL
+    };
+
+    int exit_code = rtems_bsd_command_ifconfig(6, ifcfg_argv);
+    if (exit_code != 0) {
+        LOG_ERROR("NET", "Failed to configure IPv6 address: %d", exit_code);
+        return;
+    }
+
+    LOG_INFO("NET", "IPv6: %s/%d", cfg->ipv6.address, cfg->ipv6.prefix_len);
+
+    /* Add default gateway if specified */
+    if (cfg->ipv6.gateway[0] != '\0') {
+        char *route_default_argv[] = {
+            "route",
+            "add",
+            "-inet6",
+            "default",
+            (char *)cfg->ipv6.gateway,
+            NULL
+        };
+
+        rtems_bsd_command_route(5, route_default_argv);
+        LOG_INFO("NET", "IPv6 gateway: %s", cfg->ipv6.gateway);
+    }
+}
+
+/*
+ * Start dhcpcd daemon for DHCP/SLAAC.
+ */
+static void network_start_dhcpcd(const network_config_t *cfg)
+{
+    rtems_status_code sc;
+
+    /* Create /etc directory if it doesn't exist */
+    mkdir("/etc", 0755);
+
+    /* Create dhcpcd configuration file */
+    int fd = open("/etc/dhcpcd.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG_ERROR("NET", "Cannot create /etc/dhcpcd.conf: %s", strerror(errno));
+        return;
+    }
+
+    /* Write configuration based on settings */
+    const char *header = "# Auto-generated dhcpcd configuration\n";
+    write(fd, header, strlen(header));
+
+    /* Client ID for DHCP */
+    const char *clientid = "clientid sattrack-controller\n";
+    write(fd, clientid, strlen(clientid));
+
+    /* Interface-specific configuration */
+    char iface_line[64];
+    snprintf(iface_line, sizeof(iface_line), "interface %s\n", cfg->interface);
+    write(fd, iface_line, strlen(iface_line));
+
+    /* Control IPv4 DHCP */
+    if (!cfg->ipv4.enabled || !cfg->ipv4.dhcp) {
+        const char *nodhcp = "nodhcp\n";
+        write(fd, nodhcp, strlen(nodhcp));
+    }
+
+    /* Control IPv6 DHCPv6 */
+    if (!cfg->ipv6.enabled || !cfg->ipv6.dhcp) {
+        const char *nodhcp6 = "nodhcp6\n";
+        write(fd, nodhcp6, strlen(nodhcp6));
+    }
+
+    /* Control SLAAC - dhcpcd handles SLAAC by default when IPv6 is enabled */
+    if (!cfg->ipv6.enabled || !cfg->ipv6.slaac) {
+        const char *noipv6rs = "noipv6rs\n";
+        write(fd, noipv6rs, strlen(noipv6rs));
+    }
+
+    close(fd);
+
+    /* Start dhcpcd */
+    LOG_INFO("NET", "Starting dhcpcd...");
+    sc = rtems_dhcpcd_start(NULL);
+    if (sc != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("NET", "Failed to start dhcpcd: %d", sc);
+    }
+}
+
+/*
+ * Get current network interface addresses for status display.
+ * Populates ipv4_addr and ipv6_addr buffers with current addresses.
+ */
+static void network_get_addresses(const char *ifname,
+                                   char *ipv4_addr, size_t ipv4_len,
+                                   char *ipv6_addr, size_t ipv6_len)
+{
+    struct ifaddrs *ifap, *ifa;
+
+    ipv4_addr[0] = '\0';
+    ipv6_addr[0] = '\0';
+
+    if (getifaddrs(&ifap) != 0) {
+        return;
+    }
+
+    for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+        if (strcmp(ifa->ifa_name, ifname) != 0) {
+            continue;
+        }
+
+        if (ifa->ifa_addr == NULL) {
+            continue;
+        }
+
+        if (ifa->ifa_addr->sa_family == AF_INET && ipv4_addr[0] == '\0') {
+            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, ipv4_addr, ipv4_len);
+        }
+        else if (ifa->ifa_addr->sa_family == AF_INET6 && ipv6_addr[0] == '\0') {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+            /* Skip link-local addresses for display */
+            if (!IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
+                inet_ntop(AF_INET6, &sin6->sin6_addr, ipv6_addr, ipv6_len);
+            }
+        }
+    }
+
+    freeifaddrs(ifap);
+}
+
+/*
+ * Initialize networking based on configuration.
+ * Must be called after rtems_bsd_initialize() and before tasks start.
+ * Returns true on success, false on failure.
+ */
+static bool network_init(const network_config_t *cfg)
+{
+    int exit_code;
+
+    if (!cfg->enabled) {
+        LOG_INFO("NET", "Networking disabled in configuration");
+        return true;
+    }
+
+    LOG_INFO("NET", "Initializing network interface %s...", cfg->interface);
+
+    /* Configure loopback interface first */
+    exit_code = rtems_bsd_ifconfig_lo0();
+    if (exit_code != 0) {
+        LOG_WARN("NET", "Failed to configure loopback interface: %d", exit_code);
+    }
+
+    /* Wait for the Ethernet interface to appear */
+    if (!network_wait_for_interface(cfg->interface, 10)) {
+        LOG_ERROR("NET", "Network interface %s not found", cfg->interface);
+        return false;
+    }
+
+    /* Bring up the interface */
+    char *ifup_argv[] = {
+        "ifconfig",
+        (char *)cfg->interface,
+        "up",
+        NULL
+    };
+    rtems_bsd_command_ifconfig(3, ifup_argv);
+
+    /* Configure IPv4 */
+    if (cfg->ipv4.enabled) {
+        if (cfg->ipv4.dhcp) {
+            LOG_INFO("NET", "IPv4: Using DHCP");
+        } else if (cfg->ipv4.address[0] != '\0') {
+            network_configure_ipv4_static(cfg);
+        }
+    }
+
+    /* Configure IPv6 */
+    if (cfg->ipv6.enabled) {
+        if (cfg->ipv6.slaac || cfg->ipv6.dhcp) {
+            LOG_INFO("NET", "IPv6: Using %s%s%s",
+                     cfg->ipv6.slaac ? "SLAAC" : "",
+                     (cfg->ipv6.slaac && cfg->ipv6.dhcp) ? "+" : "",
+                     cfg->ipv6.dhcp ? "DHCPv6" : "");
+        } else if (cfg->ipv6.address[0] != '\0') {
+            network_configure_ipv6_static(cfg);
+        }
+    }
+
+    /* Start dhcpcd if DHCP is enabled for either protocol */
+    if ((cfg->ipv4.enabled && cfg->ipv4.dhcp) ||
+        (cfg->ipv6.enabled && (cfg->ipv6.dhcp || cfg->ipv6.slaac))) {
+        network_start_dhcpcd(cfg);
+    }
+
+    return true;
+}
+
+// ============================================================================
 // Task Entry Points
 // ============================================================================
 
@@ -1114,6 +1406,35 @@ rtems_task status_task(rtems_task_argument arg) {
 
         // TLE database status
         LOG_INFO("STATUS", "TLE: %d satellites loaded", sat_count);
+
+        // Network status
+        {
+            config_t net_cfg;
+            config_get_copy(&net_cfg);
+
+            if (net_cfg.network.enabled) {
+                char ipv4_addr[CONFIG_IPV4_ADDR_MAX];
+                char ipv6_addr[CONFIG_IPV6_ADDR_MAX];
+
+                network_get_addresses(net_cfg.network.interface,
+                                      ipv4_addr, sizeof(ipv4_addr),
+                                      ipv6_addr, sizeof(ipv6_addr));
+
+                if (ipv4_addr[0] != '\0' || ipv6_addr[0] != '\0') {
+                    LOG_INFO("STATUS", "Network: %s", net_cfg.network.interface);
+                    if (ipv4_addr[0] != '\0') {
+                        LOG_INFO("STATUS", "  IPv4: %s", ipv4_addr);
+                    }
+                    if (ipv6_addr[0] != '\0') {
+                        LOG_INFO("STATUS", "  IPv6: %s", ipv6_addr);
+                    }
+                } else {
+                    LOG_INFO("STATUS", "Network: %s (no address)", net_cfg.network.interface);
+                }
+            } else {
+                LOG_INFO("STATUS", "Network: disabled");
+            }
+        }
     }
 }
 
@@ -1747,6 +2068,15 @@ rtems_task Init(rtems_task_argument ignored) {
     status = config_system_init(NULL);
     if (status != RTEMS_SUCCESSFUL) {
         LOG_WARN("INIT", "Config init failed, using defaults");
+    }
+
+    // Initialize networking
+    {
+        config_t cfg;
+        config_get_copy(&cfg);
+        if (!network_init(&cfg.network)) {
+            LOG_WARN("INIT", "Network initialization failed");
+        }
     }
 
     // Create IPC objects

@@ -147,7 +147,8 @@ typedef enum {
     SECTION_SERIAL,
     SECTION_OBSERVER,
     SECTION_FILES,
-    SECTION_SYSTEM
+    SECTION_SYSTEM,
+    SECTION_NETWORK
 } config_section_t;
 
 /*
@@ -166,6 +167,9 @@ static config_section_t identify_section(const char *name)
     }
     if (strcasecmp_local(name, "system") == 0) {
         return SECTION_SYSTEM;
+    }
+    if (strcasecmp_local(name, "network") == 0) {
+        return SECTION_NETWORK;
     }
     return SECTION_NONE;
 }
@@ -249,6 +253,53 @@ static void process_system_key(config_t *cfg, const char *key, const char *value
     }
 }
 
+/*
+ * Process a key=value pair for the [network] section.
+ */
+static void process_network_key(config_t *cfg, const char *key, const char *value)
+{
+    if (strcasecmp_local(key, "enabled") == 0) {
+        cfg->network.enabled = parse_bool(value, true);
+    } else if (strcasecmp_local(key, "interface") == 0) {
+        strncpy(cfg->network.interface, value, CONFIG_IFACE_NAME_MAX - 1);
+        cfg->network.interface[CONFIG_IFACE_NAME_MAX - 1] = '\0';
+    }
+    /* IPv4 settings */
+    else if (strcasecmp_local(key, "ipv4_enabled") == 0) {
+        cfg->network.ipv4.enabled = parse_bool(value, true);
+    } else if (strcasecmp_local(key, "ipv4_dhcp") == 0) {
+        cfg->network.ipv4.dhcp = parse_bool(value, true);
+    } else if (strcasecmp_local(key, "ipv4_address") == 0) {
+        strncpy(cfg->network.ipv4.address, value, CONFIG_IPV4_ADDR_MAX - 1);
+        cfg->network.ipv4.address[CONFIG_IPV4_ADDR_MAX - 1] = '\0';
+    } else if (strcasecmp_local(key, "ipv4_netmask") == 0) {
+        strncpy(cfg->network.ipv4.netmask, value, CONFIG_IPV4_ADDR_MAX - 1);
+        cfg->network.ipv4.netmask[CONFIG_IPV4_ADDR_MAX - 1] = '\0';
+    } else if (strcasecmp_local(key, "ipv4_gateway") == 0) {
+        strncpy(cfg->network.ipv4.gateway, value, CONFIG_IPV4_ADDR_MAX - 1);
+        cfg->network.ipv4.gateway[CONFIG_IPV4_ADDR_MAX - 1] = '\0';
+    }
+    /* IPv6 settings */
+    else if (strcasecmp_local(key, "ipv6_enabled") == 0) {
+        cfg->network.ipv6.enabled = parse_bool(value, true);
+    } else if (strcasecmp_local(key, "ipv6_dhcp") == 0) {
+        cfg->network.ipv6.dhcp = parse_bool(value, true);
+    } else if (strcasecmp_local(key, "ipv6_slaac") == 0) {
+        cfg->network.ipv6.slaac = parse_bool(value, true);
+    } else if (strcasecmp_local(key, "ipv6_address") == 0) {
+        strncpy(cfg->network.ipv6.address, value, CONFIG_IPV6_ADDR_MAX - 1);
+        cfg->network.ipv6.address[CONFIG_IPV6_ADDR_MAX - 1] = '\0';
+    } else if (strcasecmp_local(key, "ipv6_prefix_len") == 0) {
+        cfg->network.ipv6.prefix_len = atoi(value);
+        if (cfg->network.ipv6.prefix_len < 1 || cfg->network.ipv6.prefix_len > 128) {
+            cfg->network.ipv6.prefix_len = 64;
+        }
+    } else if (strcasecmp_local(key, "ipv6_gateway") == 0) {
+        strncpy(cfg->network.ipv6.gateway, value, CONFIG_IPV6_ADDR_MAX - 1);
+        cfg->network.ipv6.gateway[CONFIG_IPV6_ADDR_MAX - 1] = '\0';
+    }
+}
+
 // ============================================================================
 // Public Functions
 // ============================================================================
@@ -288,6 +339,22 @@ void config_init_defaults(config_t *cfg)
     /* System settings */
     cfg->log_level = LOG_LEVEL_INFO;
     cfg->status_interval_sec = 30;
+
+    /* Network defaults */
+    cfg->network.enabled = true;
+    strncpy(cfg->network.interface, "cpsw0", CONFIG_IFACE_NAME_MAX - 1);
+    cfg->network.interface[CONFIG_IFACE_NAME_MAX - 1] = '\0';
+    cfg->network.ipv4.enabled = true;
+    cfg->network.ipv4.dhcp = true;
+    cfg->network.ipv4.address[0] = '\0';
+    cfg->network.ipv4.netmask[0] = '\0';
+    cfg->network.ipv4.gateway[0] = '\0';
+    cfg->network.ipv6.enabled = true;
+    cfg->network.ipv6.dhcp = true;
+    cfg->network.ipv6.slaac = true;
+    cfg->network.ipv6.address[0] = '\0';
+    cfg->network.ipv6.prefix_len = 64;
+    cfg->network.ipv6.gateway[0] = '\0';
 
     cfg->loaded = false;
     cfg->source_path[0] = '\0';
@@ -360,6 +427,9 @@ config_error_t config_load(config_t *cfg, const char *path)
             case SECTION_SYSTEM:
                 process_system_key(cfg, key, value);
                 break;
+            case SECTION_NETWORK:
+                process_network_key(cfg, key, value);
+                break;
             default:
                 LOG_DEBUG("CONFIG", "Line %d: Key '%s' outside section",
                           line_num, key);
@@ -430,7 +500,23 @@ config_error_t config_save(const config_t *cfg, const char *path)
         case LOG_LEVEL_ERROR: level_str = "ERROR"; break;
     }
     fprintf(f, "log_level = %s\n", level_str);
-    fprintf(f, "status_interval = %d\n", cfg->status_interval_sec);
+    fprintf(f, "status_interval = %d\n\n", cfg->status_interval_sec);
+
+    /* [network] section */
+    fprintf(f, "[network]\n");
+    fprintf(f, "enabled = %s\n", cfg->network.enabled ? "true" : "false");
+    fprintf(f, "interface = %s\n", cfg->network.interface);
+    fprintf(f, "ipv4_enabled = %s\n", cfg->network.ipv4.enabled ? "true" : "false");
+    fprintf(f, "ipv4_dhcp = %s\n", cfg->network.ipv4.dhcp ? "true" : "false");
+    fprintf(f, "ipv4_address = %s\n", cfg->network.ipv4.address);
+    fprintf(f, "ipv4_netmask = %s\n", cfg->network.ipv4.netmask);
+    fprintf(f, "ipv4_gateway = %s\n", cfg->network.ipv4.gateway);
+    fprintf(f, "ipv6_enabled = %s\n", cfg->network.ipv6.enabled ? "true" : "false");
+    fprintf(f, "ipv6_dhcp = %s\n", cfg->network.ipv6.dhcp ? "true" : "false");
+    fprintf(f, "ipv6_slaac = %s\n", cfg->network.ipv6.slaac ? "true" : "false");
+    fprintf(f, "ipv6_address = %s\n", cfg->network.ipv6.address);
+    fprintf(f, "ipv6_prefix_len = %d\n", cfg->network.ipv6.prefix_len);
+    fprintf(f, "ipv6_gateway = %s\n", cfg->network.ipv6.gateway);
 
     fclose(f);
 

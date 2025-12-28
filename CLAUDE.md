@@ -4,9 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## RTEMS Installation
 
-The RTEMS 7 toolchain and source are installed at:
+The RTEMS 7 toolchain, kernel, and libbsd are installed at:
 - **Toolchain/executables**: `$HOME/rtems/7` (e.g., `~/rtems/7/bin/arm-rtems7-gcc`)
 - **Source code**: `$HOME/rtems/src`
+- **rtems-libbsd**: Custom fork from https://github.com/vaelen/rtems-libbsd (branch: `7-freebsd-14-beaglebone-black`)
+
+**Note:** This project requires the custom rtems-libbsd fork for BeagleBone Black SD card and networking support. Use `buildset/bbb.ini` when building rtems-libbsd.
 
 ## Build Commands
 

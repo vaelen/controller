@@ -27,6 +27,10 @@
 #define CONFIG_DEFAULT_PATH "/mnt/sd/config.ini"
 #define CONFIG_SD_MOUNT     "/mnt/sd"
 
+#define CONFIG_IPV4_ADDR_MAX    16   /* "255.255.255.255\0" */
+#define CONFIG_IPV6_ADDR_MAX    46   /* Full IPv6 address with scope */
+#define CONFIG_IFACE_NAME_MAX   16   /* Interface name e.g., "cpsw0" */
+
 // ============================================================================
 // Error Codes
 // ============================================================================
@@ -66,6 +70,39 @@ typedef struct observer_config {
 } observer_config_t;
 
 /*
+ * IPv4 network configuration.
+ */
+typedef struct ipv4_config {
+    bool enabled;
+    bool dhcp;
+    char address[CONFIG_IPV4_ADDR_MAX];
+    char netmask[CONFIG_IPV4_ADDR_MAX];
+    char gateway[CONFIG_IPV4_ADDR_MAX];
+} ipv4_config_t;
+
+/*
+ * IPv6 network configuration.
+ */
+typedef struct ipv6_config {
+    bool enabled;
+    bool dhcp;       /* DHCPv6 */
+    bool slaac;      /* Stateless Address Autoconfiguration */
+    char address[CONFIG_IPV6_ADDR_MAX];
+    int prefix_len;
+    char gateway[CONFIG_IPV6_ADDR_MAX];
+} ipv6_config_t;
+
+/*
+ * Complete network configuration.
+ */
+typedef struct network_config {
+    bool enabled;
+    char interface[CONFIG_IFACE_NAME_MAX];
+    ipv4_config_t ipv4;
+    ipv6_config_t ipv6;
+} network_config_t;
+
+/*
  * Complete configuration structure.
  */
 typedef struct config {
@@ -76,6 +113,9 @@ typedef struct config {
 
     /* Observer location */
     observer_config_t observer;
+
+    /* Network configuration */
+    network_config_t network;
 
     /* File paths */
     char tle_path[CONFIG_PATH_MAX];

@@ -107,7 +107,35 @@ cd $HOME/rtems/src/rtems
 
 You can build multiple BSPs by repeating step 5 with different BSP names.
 
-#### 6. Verify Installation
+#### 6. Clone and Build rtems-libbsd
+
+This project uses rtems-libbsd for networking and SD card support. A [custom fork](https://github.com/vaelen/rtems-libbsd/tree/7-freebsd-14-beaglebone-black) is required for BeagleBone Black that fixes driver issues in the official rtems-libbsd release.
+
+**Clone the custom fork:**
+
+```bash
+cd $HOME/rtems/src
+git clone -b 7-freebsd-14-beaglebone-black https://github.com/vaelen/rtems-libbsd.git
+cd rtems-libbsd
+git submodule init
+git submodule update rtems_waf
+```
+
+**Build and install:**
+
+```bash
+./waf configure --prefix=$HOME/rtems/7 \
+    --rtems-bsps=arm/beagleboneblack \
+    --buildset=buildset/bbb.ini
+./waf
+./waf install
+```
+
+The `buildset/bbb.ini` configuration enables SD card and networking support while disabling components that are not needed or cause issues on BeagleBone Black.
+
+For technical details about the BeagleBone Black fixes, see [sdcard.md](sdcard.md) and [networking.md](networking.md).
+
+#### 7. Verify Installation
 
 ```bash
 ls $HOME/rtems/7/arm-rtems7/

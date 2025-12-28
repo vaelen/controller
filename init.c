@@ -62,5 +62,22 @@ rtems_task Init(rtems_task_argument argument);
 RTEMS_BSD_DEFINE_NEXUS_DEVICE(ofwbus, 0, 0, NULL);
 SYSINIT_DRIVER_REFERENCE(simplebus, ofwbus);
 SYSINIT_DRIVER_REFERENCE(ti_scm, simplebus);
+SYSINIT_DRIVER_REFERENCE(ti_scm_syscon, ti_scm);
+SYSINIT_DRIVER_REFERENCE(ti_sysc, simplebus);
 SYSINIT_DRIVER_REFERENCE(sdhci_ti, simplebus);
 SYSINIT_DRIVER_REFERENCE(mmcsd, mmc);
+
+/*
+ * Ethernet driver for BeagleBone Black.
+ *
+ * The cpswss (CPSW Subsystem) driver attaches to simplebus when it finds
+ * a "ti,cpsw" compatible node in the device tree. The cpsw driver creates
+ * the network interface (cpsw0) and attaches to cpswss. The ukphy driver
+ * is a generic Ethernet PHY driver.
+ *
+ * We need SYSINIT_DRIVER_REFERENCE for cpswss to ensure it's linked from
+ * libbsd.a, since we're not using the standard nexus-devices.h include.
+ */
+SYSINIT_DRIVER_REFERENCE(cpswss, simplebus);
+SYSINIT_DRIVER_REFERENCE(cpsw, cpswss);
+SYSINIT_DRIVER_REFERENCE(ukphy, miibus);
