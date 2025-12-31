@@ -37,5 +37,5 @@ def build(bld):
         cflags = common_cflags,
         linkflags = ['-Wl,--allow-multiple-definition'],
         lib = ['bsd', 'm'],
-        source = ['console-config.c', 'init.c', 'controller.c', 'log.c', 'sgp4.c', 'nmea.c', 'config.c'],)
+        source = ['console-config.c', 'init.c', 'controller.c', 'log.c', 'sgp4.c', 'nmea.c', 'config.c', 'https_client.c', 'openssl_stubs.c'],)
 

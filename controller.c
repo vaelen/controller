@@ -33,6 +33,7 @@
 #include "nmea.h"
 #include "log.h"
 #include "config.h"
+#include "https_client.h"
 
 #include <sys/stat.h>
 #include <rtems/dosfs.h>
@@ -58,7 +59,11 @@
 // Configuration Constants
 // ============================================================================
 
-#define MAX_SATELLITES 32
+#define MAX_SATELLITES CONFIG_MAX_NORAD_IDS
+
+// TLE file paths
+#define TLE_FILE_PATH       "/mnt/sd/sats.tle"
+#define TLE_TEMP_FILE_PATH  "/mnt/sd/sats.tle.tmp"
 
 // ============================================================================
 // Message Types
@@ -297,6 +302,7 @@ static rtems_id g_status_task_id;
 #define PRIORITY_STATUS         80
 
 #define TASK_STACK_SIZE     (8 * 1024)
+#define TLE_TASK_STACK_SIZE (32 * 1024)  /* OpenSSL needs more stack */
 
 // ============================================================================
 // Serial Port Initialization
@@ -739,6 +745,37 @@ static void network_configure_ipv6_static(const network_config_t *cfg)
 }
 
 /*
+ * Create /etc/resolv.conf with fallback DNS servers.
+ * dhcpcd may override this with DHCP-provided servers, but if DNS
+ * information isn't provided by DHCP, these fallbacks will be used.
+ */
+static void network_create_resolv_conf(void)
+{
+    /* Create /etc directory if it doesn't exist */
+    mkdir("/etc", 0755);
+
+    int fd = open("/etc/resolv.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG_ERROR("NET", "Cannot create /etc/resolv.conf: %s", strerror(errno));
+        return;
+    }
+
+    /* Write fallback DNS servers */
+    const char *resolv_conf =
+        "# Fallback DNS servers for satellite tracking controller\n"
+        "# These may be overwritten by dhcpcd if DHCP provides DNS servers\n"
+        "nameserver 1.1.1.1\n"
+        "nameserver 8.8.8.8\n"
+        "nameserver 2606:4700:4700::1111\n"
+        "nameserver 2001:4860:4860::8888\n";
+
+    write(fd, resolv_conf, strlen(resolv_conf));
+    close(fd);
+
+    LOG_DEBUG("NET", "Created /etc/resolv.conf with fallback DNS servers");
+}
+
+/*
  * Start dhcpcd daemon for DHCP/SLAAC.
  */
 static void network_start_dhcpcd(const network_config_t *cfg)
@@ -853,6 +890,9 @@ static bool network_init(const network_config_t *cfg)
     }
 
     LOG_INFO("NET", "Initializing network interface %s...", cfg->interface);
+
+    /* Create resolv.conf with fallback DNS servers */
+    network_create_resolv_conf();
 
     /* Configure loopback interface first */
     exit_code = rtems_bsd_ifconfig_lo0();
@@ -1267,26 +1307,418 @@ rtems_task radio_status_task(rtems_task_argument arg) {
     }
 }
 
+// ============================================================================
+// TLE Stream Parser for Download Filtering
+// ============================================================================
+
+/*
+ * Parser states for streaming TLE data.
+ */
+typedef enum tle_parser_state {
+    TLE_STATE_NAME = 0,   /* Expecting name line (line 0) */
+    TLE_STATE_LINE1 = 1,  /* Expecting TLE line 1 */
+    TLE_STATE_LINE2 = 2   /* Expecting TLE line 2 */
+} tle_parser_state_t;
+
+/*
+ * TLE stream parser context for filtering during download.
+ */
+typedef struct tle_stream_parser {
+    char line_buf[256];              /* Buffer for accumulating current line */
+    int line_len;                    /* Current line length */
+    char name_line[SGP4_TLE_NAME_LEN]; /* Satellite name */
+    char line1[SGP4_TLE_LINE_LEN];   /* TLE line 1 */
+    char line2[SGP4_TLE_LINE_LEN];   /* TLE line 2 */
+    tle_parser_state_t state;        /* Current parser state */
+    const int *norad_ids;            /* NORAD IDs to filter (NULL = accept all) */
+    int norad_count;                 /* Number of NORAD IDs in filter */
+    FILE *output_file;               /* File to write filtered TLE data */
+    int total_parsed;                /* Total TLE entries parsed */
+    int matches_found;               /* Number of matching satellites */
+    int max_matches;                 /* Maximum matches to accept */
+} tle_stream_parser_t;
+
+/*
+ * Initialize TLE stream parser.
+ */
+static void tle_parser_init(tle_stream_parser_t *parser, const int *norad_ids,
+                            int norad_count, FILE *output_file, int max_matches)
+{
+    memset(parser, 0, sizeof(*parser));
+    parser->norad_ids = norad_ids;
+    parser->norad_count = norad_count;
+    parser->output_file = output_file;
+    parser->max_matches = max_matches;
+    parser->state = TLE_STATE_NAME;
+}
+
+/*
+ * Check if NORAD ID is in the filter list.
+ * Returns true if the ID should be accepted.
+ */
+static bool tle_parser_should_accept(const tle_stream_parser_t *parser, int norad_id)
+{
+    /* If no filter list, accept based on max_matches limit */
+    if (parser->norad_ids == NULL || parser->norad_count == 0) {
+        return parser->matches_found < parser->max_matches;
+    }
+
+    /* Check if ID is in the filter list */
+    for (int i = 0; i < parser->norad_count; i++) {
+        if (parser->norad_ids[i] == norad_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Extract NORAD ID from TLE line 1.
+ * Line 1 format: "1 NNNNN..." where NNNNN is the 5-digit NORAD ID at columns 3-7.
+ */
+static int tle_parser_extract_norad_id(const char *line1)
+{
+    if (strlen(line1) < 7) {
+        return -1;
+    }
+    if (line1[0] != '1') {
+        return -1;
+    }
+
+    /* Extract NORAD ID from columns 3-7 (0-indexed: 2-6) */
+    char id_str[6];
+    memcpy(id_str, &line1[2], 5);
+    id_str[5] = '\0';
+
+    return atoi(id_str);
+}
+
+/*
+ * Process a complete TLE entry (name, line1, line2).
+ * Returns true if the entry was accepted and written.
+ */
+static bool tle_parser_process_entry(tle_stream_parser_t *parser)
+{
+    parser->total_parsed++;
+
+    /* Extract NORAD ID from line 1 */
+    int norad_id = tle_parser_extract_norad_id(parser->line1);
+    if (norad_id < 0) {
+        LOG_DEBUG("TLE", "Invalid TLE line 1: %s", parser->line1);
+        return false;
+    }
+
+    /* Check if we should accept this satellite */
+    if (!tle_parser_should_accept(parser, norad_id)) {
+        return false;
+    }
+
+    /* Write to output file */
+    if (parser->output_file != NULL) {
+        fprintf(parser->output_file, "%s\n%s\n%s\n",
+                parser->name_line, parser->line1, parser->line2);
+    }
+
+    parser->matches_found++;
+    LOG_DEBUG("TLE", "Accepted satellite: %s (NORAD %d), %d/%d",
+              parser->name_line, norad_id, parser->matches_found, parser->max_matches);
+
+    return true;
+}
+
+/*
+ * Process a single line from the TLE stream.
+ * Called for each complete line received.
+ */
+static void tle_parser_process_line(tle_stream_parser_t *parser, const char *line)
+{
+    /* Skip empty lines */
+    size_t len = strlen(line);
+    if (len == 0) {
+        return;
+    }
+
+    /* Determine line type based on first character */
+    if (line[0] == '1' && len >= 69) {
+        /* This is TLE line 1 */
+        if (parser->state == TLE_STATE_NAME) {
+            /* No name line before line 1, use empty name */
+            parser->name_line[0] = '\0';
+        }
+        strncpy(parser->line1, line, SGP4_TLE_LINE_LEN - 1);
+        parser->line1[SGP4_TLE_LINE_LEN - 1] = '\0';
+        parser->state = TLE_STATE_LINE2;
+    }
+    else if (line[0] == '2' && len >= 69) {
+        /* This is TLE line 2 */
+        if (parser->state == TLE_STATE_LINE2) {
+            strncpy(parser->line2, line, SGP4_TLE_LINE_LEN - 1);
+            parser->line2[SGP4_TLE_LINE_LEN - 1] = '\0';
+
+            /* Process complete TLE entry */
+            tle_parser_process_entry(parser);
+        }
+        parser->state = TLE_STATE_NAME;
+    }
+    else {
+        /* This is a name line */
+        strncpy(parser->name_line, line, SGP4_TLE_NAME_LEN - 1);
+        parser->name_line[SGP4_TLE_NAME_LEN - 1] = '\0';
+
+        /* Trim trailing whitespace from name */
+        int name_len = strlen(parser->name_line);
+        while (name_len > 0 && (parser->name_line[name_len - 1] == ' ' ||
+                                 parser->name_line[name_len - 1] == '\r' ||
+                                 parser->name_line[name_len - 1] == '\n')) {
+            parser->name_line[--name_len] = '\0';
+        }
+
+        parser->state = TLE_STATE_LINE1;
+    }
+}
+
+/*
+ * Feed data chunk to parser.
+ * Handles partial lines across chunks.
+ */
+static void tle_parser_feed(tle_stream_parser_t *parser, const char *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        char c = data[i];
+
+        if (c == '\n') {
+            /* End of line - process it */
+            parser->line_buf[parser->line_len] = '\0';
+
+            /* Strip trailing CR if present */
+            if (parser->line_len > 0 && parser->line_buf[parser->line_len - 1] == '\r') {
+                parser->line_buf[parser->line_len - 1] = '\0';
+            }
+
+            tle_parser_process_line(parser, parser->line_buf);
+
+            parser->line_len = 0;
+
+            /* Stop if we've reached max matches */
+            if (parser->matches_found >= parser->max_matches) {
+                return;
+            }
+        }
+        else if (parser->line_len < (int)sizeof(parser->line_buf) - 1) {
+            /* Add character to line buffer */
+            parser->line_buf[parser->line_len++] = c;
+        }
+    }
+}
+
+/*
+ * HTTPS callback for TLE download.
+ * Parses incoming data and filters satellites.
+ */
+static bool tle_download_callback(const char *data, size_t len, void *user_data)
+{
+    tle_stream_parser_t *parser = (tle_stream_parser_t *)user_data;
+
+    tle_parser_feed(parser, data, len);
+
+    /* Continue reading unless we've found enough matches */
+    return parser->matches_found < parser->max_matches;
+}
+
+// ============================================================================
+// TLE Database Loading
+// ============================================================================
+
+/*
+ * Load TLE database from file into global state.
+ * Must be called with g_tle_database_mutex held.
+ */
+static int load_tle_database(const char *filepath)
+{
+    FILE *file = fopen(filepath, "r");
+    if (file == NULL) {
+        LOG_DEBUG("TLE", "Cannot open TLE file: %s", filepath);
+        return -1;
+    }
+
+    int count = 0;
+    sgp4_tle_t tle;
+    sgp4_error_t err;
+
+    while ((err = sgp4_read_tle_stream(file, &tle)) == SGP4_SUCCESS && count < MAX_SATELLITES) {
+        /* Convert TLE to SGP4 elements and initialize state */
+        sgp4_elements_t elements;
+        err = sgp4_tle_to_elements(&tle, &elements);
+        if (err != SGP4_SUCCESS) {
+            LOG_WARN("TLE", "Failed to convert TLE for %s: %d", tle.name, err);
+            continue;
+        }
+
+        sgp4_state_t state;
+        err = sgp4_init(&state, &elements);
+        if (err != SGP4_SUCCESS) {
+            LOG_WARN("TLE", "Failed to init SGP4 for %s: %d", tle.name, err);
+            continue;
+        }
+
+        /* Store in database */
+        g_state.satellites[count].valid = true;
+        g_state.satellites[count].tle = tle;
+        g_state.satellites[count].state = state;
+        count++;
+
+        LOG_DEBUG("TLE", "Loaded: %s (NORAD %d)", tle.name, tle.norad_id);
+    }
+
+    fclose(file);
+
+    g_state.satellite_count = count;
+    LOG_INFO("TLE", "Loaded %d satellites from %s", count, filepath);
+
+    return count;
+}
+
+/*
+ * Check if network is available (has a valid IP address).
+ */
+static bool network_is_available(const char *ifname)
+{
+    char ipv4_addr[CONFIG_IPV4_ADDR_MAX];
+    char ipv6_addr[CONFIG_IPV6_ADDR_MAX];
+
+    network_get_addresses(ifname, ipv4_addr, sizeof(ipv4_addr),
+                          ipv6_addr, sizeof(ipv6_addr));
+
+    return (ipv4_addr[0] != '\0' || ipv6_addr[0] != '\0');
+}
+
+/*
+ * Download TLE data from URL and save filtered results to file.
+ * Returns number of satellites saved, or -1 on error.
+ */
+static int download_tle_data(const char *url, const int *norad_ids, int norad_count,
+                             const char *output_path, int max_satellites)
+{
+    /* Open output file */
+    FILE *output = fopen(output_path, "w");
+    if (output == NULL) {
+        LOG_ERROR("TLE", "Failed to create temp file: %s", output_path);
+        return -1;
+    }
+
+    /* Initialize parser - static to reduce stack usage */
+    static tle_stream_parser_t parser;
+    tle_parser_init(&parser, norad_ids, norad_count, output, max_satellites);
+
+    /* Download and parse */
+    LOG_INFO("TLE", "Downloading TLE from: %s", url);
+
+    https_error_t err = https_get_stream(url, 60, tle_download_callback, &parser);
+
+    fclose(output);
+
+    if (err != HTTPS_SUCCESS) {
+        LOG_ERROR("TLE", "Download failed: %s", https_error_string(err));
+        unlink(output_path);
+        return -1;
+    }
+
+    LOG_INFO("TLE", "Download complete: parsed %d, matched %d satellites",
+             parser.total_parsed, parser.matches_found);
+
+    return parser.matches_found;
+}
+
 /*
  * TLE Updater Task
  *
- * Periodically updates the TLE database.
- * May fetch from network, read from file, or receive via other means.
+ * Downloads TLE data from configured URL, filters by configured satellites,
+ * saves to SD card, and loads into memory.
  * Notifies controller when database is updated.
  */
 rtems_task tle_updater_task(rtems_task_argument arg) {
     (void)arg;
     LOG_INFO("TLE", "Updater task started");
 
-    while (true) {
-        // TODO: Fetch TLE data from source (network, file, etc.)
-        // TODO: Acquire g_tle_database_mutex
-        // TODO: Update g_state.satellites with new TLE data
-        // TODO: Release g_tle_database_mutex
-        // TODO: Send tle_update_message_t to g_tle_queue to notify controller
+    /* Get initial configuration - static to reduce stack usage */
+    static config_t cfg;
+    config_get_copy(&cfg);
 
-        // Stub: simulate periodic TLE update (every 4 hours)
-        rtems_task_wake_after(4 * 60 * 60 * rtems_clock_get_ticks_per_second());
+    /* Try to load existing TLE from file on startup */
+    rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+    int loaded = load_tle_database(TLE_FILE_PATH);
+    rtems_semaphore_release(g_tle_database_mutex);
+
+    if (loaded > 0) {
+        /* Notify controller that TLE database is ready */
+        tle_update_message_t msg;
+        msg.type = MSG_TLE_DATABASE_UPDATED;
+        rtems_message_queue_send(g_tle_queue, &msg, sizeof(msg));
+    }
+
+    /* Main update loop */
+    while (true) {
+        /* Refresh configuration */
+        config_get_copy(&cfg);
+
+        /* Check if networking is enabled */
+        if (!cfg.network.enabled) {
+            LOG_DEBUG("TLE", "Network disabled, skipping update");
+            rtems_task_wake_after(cfg.tle_update_interval_hours * 60 * 60 *
+                                  rtems_clock_get_ticks_per_second());
+            continue;
+        }
+
+        /* Wait for network to be available */
+        int retries = 0;
+        while (!network_is_available(cfg.network.interface) && retries < 12) {
+            LOG_DEBUG("TLE", "Waiting for network...");
+            rtems_task_wake_after(5 * rtems_clock_get_ticks_per_second());
+            retries++;
+        }
+
+        if (!network_is_available(cfg.network.interface)) {
+            LOG_WARN("TLE", "Network not available after 60s, will retry later");
+            rtems_task_wake_after(5 * 60 * rtems_clock_get_ticks_per_second());
+            continue;
+        }
+
+        /* Download TLE data to temp file */
+        int downloaded = download_tle_data(
+            cfg.tle_url,
+            cfg.satellite_count > 0 ? cfg.satellite_norad_ids : NULL,
+            cfg.satellite_count,
+            TLE_TEMP_FILE_PATH,
+            MAX_SATELLITES
+        );
+
+        if (downloaded > 0) {
+            /* Rename temp file to final location */
+            if (rename(TLE_TEMP_FILE_PATH, TLE_FILE_PATH) != 0) {
+                LOG_ERROR("TLE", "Failed to rename temp file: %s", strerror(errno));
+                unlink(TLE_TEMP_FILE_PATH);
+            } else {
+                /* Load new TLE data into memory */
+                rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+                load_tle_database(TLE_FILE_PATH);
+                rtems_semaphore_release(g_tle_database_mutex);
+
+                /* Notify controller */
+                tle_update_message_t msg;
+                msg.type = MSG_TLE_DATABASE_UPDATED;
+                rtems_message_queue_send(g_tle_queue, &msg, sizeof(msg));
+            }
+        } else if (downloaded == 0) {
+            LOG_WARN("TLE", "No matching satellites found in download");
+            unlink(TLE_TEMP_FILE_PATH);
+        } else {
+            /* Download failed, keep existing data */
+            LOG_WARN("TLE", "Download failed, keeping existing TLE data");
+        }
+
+        /* Wait for next update interval */
+        rtems_task_wake_after(cfg.tle_update_interval_hours * 60 * 60 *
+                              rtems_clock_get_ticks_per_second());
     }
 }
 
@@ -1926,11 +2358,11 @@ static rtems_status_code create_and_start_tasks(void) {
         return status;
     }
 
-    // Create TLE Updater task
+    // Create TLE Updater task (larger stack for OpenSSL)
     status = rtems_task_create(
         rtems_build_name('T', 'L', 'E', ' '),
         PRIORITY_TLE,
-        TASK_STACK_SIZE,
+        TLE_TASK_STACK_SIZE,
         RTEMS_DEFAULT_MODES,
         RTEMS_DEFAULT_ATTRIBUTES,
         &g_tle_task_id

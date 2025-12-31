@@ -148,7 +148,8 @@ typedef enum {
     SECTION_OBSERVER,
     SECTION_FILES,
     SECTION_SYSTEM,
-    SECTION_NETWORK
+    SECTION_NETWORK,
+    SECTION_TLE
 } config_section_t;
 
 /*
@@ -170,6 +171,9 @@ static config_section_t identify_section(const char *name)
     }
     if (strcasecmp_local(name, "network") == 0) {
         return SECTION_NETWORK;
+    }
+    if (strcasecmp_local(name, "tle") == 0) {
+        return SECTION_TLE;
     }
     return SECTION_NONE;
 }
@@ -300,6 +304,62 @@ static void process_network_key(config_t *cfg, const char *key, const char *valu
     }
 }
 
+/*
+ * Parse comma-separated NORAD IDs into integer array.
+ */
+static void parse_satellite_ids(config_t *cfg)
+{
+    cfg->satellite_count = 0;
+
+    if (cfg->satellites_str[0] == '\0') {
+        return;
+    }
+
+    char temp[CONFIG_SATELLITES_MAX];
+    strncpy(temp, cfg->satellites_str, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+
+    char *saveptr = NULL;
+    char *token = strtok_r(temp, ",", &saveptr);
+    while (token != NULL && cfg->satellite_count < CONFIG_MAX_NORAD_IDS) {
+        /* Trim leading whitespace */
+        while (*token && isspace((unsigned char)*token)) {
+            token++;
+        }
+        /* Trim trailing whitespace */
+        char *end = token + strlen(token) - 1;
+        while (end > token && isspace((unsigned char)*end)) {
+            *end-- = '\0';
+        }
+
+        int id = atoi(token);
+        if (id > 0) {
+            cfg->satellite_norad_ids[cfg->satellite_count++] = id;
+        }
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+}
+
+/*
+ * Process a key=value pair for the [tle] section.
+ */
+static void process_tle_key(config_t *cfg, const char *key, const char *value)
+{
+    if (strcasecmp_local(key, "url") == 0) {
+        strncpy(cfg->tle_url, value, CONFIG_URL_MAX - 1);
+        cfg->tle_url[CONFIG_URL_MAX - 1] = '\0';
+    } else if (strcasecmp_local(key, "satellites") == 0) {
+        strncpy(cfg->satellites_str, value, CONFIG_SATELLITES_MAX - 1);
+        cfg->satellites_str[CONFIG_SATELLITES_MAX - 1] = '\0';
+        parse_satellite_ids(cfg);
+    } else if (strcasecmp_local(key, "update_interval") == 0) {
+        cfg->tle_update_interval_hours = atoi(value);
+        if (cfg->tle_update_interval_hours < 1) {
+            cfg->tle_update_interval_hours = 6;
+        }
+    }
+}
+
 // ============================================================================
 // Public Functions
 // ============================================================================
@@ -334,7 +394,17 @@ void config_init_defaults(config_t *cfg)
     cfg->observer.is_set = false;
 
     /* File paths */
-    strncpy(cfg->tle_path, "/mnt/sd/tle.txt", CONFIG_PATH_MAX - 1);
+    strncpy(cfg->tle_path, "/mnt/sd/sats.tle", CONFIG_PATH_MAX - 1);
+
+    /* TLE update defaults */
+    strncpy(cfg->tle_url,
+            "https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle",
+            CONFIG_URL_MAX - 1);
+    cfg->tle_url[CONFIG_URL_MAX - 1] = '\0';
+    cfg->satellites_str[0] = '\0';
+    cfg->satellite_count = 0;
+    memset(cfg->satellite_norad_ids, 0, sizeof(cfg->satellite_norad_ids));
+    cfg->tle_update_interval_hours = 6;
 
     /* System settings */
     cfg->log_level = LOG_LEVEL_INFO;
@@ -430,6 +500,9 @@ config_error_t config_load(config_t *cfg, const char *path)
             case SECTION_NETWORK:
                 process_network_key(cfg, key, value);
                 break;
+            case SECTION_TLE:
+                process_tle_key(cfg, key, value);
+                break;
             default:
                 LOG_DEBUG("CONFIG", "Line %d: Key '%s' outside section",
                           line_num, key);
@@ -516,7 +589,13 @@ config_error_t config_save(const config_t *cfg, const char *path)
     fprintf(f, "ipv6_slaac = %s\n", cfg->network.ipv6.slaac ? "true" : "false");
     fprintf(f, "ipv6_address = %s\n", cfg->network.ipv6.address);
     fprintf(f, "ipv6_prefix_len = %d\n", cfg->network.ipv6.prefix_len);
-    fprintf(f, "ipv6_gateway = %s\n", cfg->network.ipv6.gateway);
+    fprintf(f, "ipv6_gateway = %s\n\n", cfg->network.ipv6.gateway);
+
+    /* [tle] section */
+    fprintf(f, "[tle]\n");
+    fprintf(f, "url = %s\n", cfg->tle_url);
+    fprintf(f, "satellites = %s\n", cfg->satellites_str);
+    fprintf(f, "update_interval = %d\n", cfg->tle_update_interval_hours);
 
     fclose(f);
 

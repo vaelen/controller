@@ -19,10 +19,13 @@
 // Configuration Constants
 // ============================================================================
 
-#define CONFIG_PATH_MAX     64
-#define CONFIG_LINE_MAX     128
-#define CONFIG_KEY_MAX      32
-#define CONFIG_VALUE_MAX    64
+#define CONFIG_PATH_MAX         64
+#define CONFIG_LINE_MAX         128
+#define CONFIG_KEY_MAX          32
+#define CONFIG_VALUE_MAX        64
+#define CONFIG_URL_MAX          256
+#define CONFIG_SATELLITES_MAX   512
+#define CONFIG_MAX_NORAD_IDS    64
 
 #define CONFIG_DEFAULT_PATH "/mnt/sd/config.ini"
 #define CONFIG_SD_MOUNT     "/mnt/sd"
@@ -119,6 +122,13 @@ typedef struct config {
 
     /* File paths */
     char tle_path[CONFIG_PATH_MAX];
+
+    /* TLE update configuration */
+    char tle_url[CONFIG_URL_MAX];
+    char satellites_str[CONFIG_SATELLITES_MAX];
+    int satellite_norad_ids[CONFIG_MAX_NORAD_IDS];
+    int satellite_count;
+    int tle_update_interval_hours;
 
     /* System settings */
     int log_level;              /* LOG_LEVEL_DEBUG through LOG_LEVEL_ERROR */
