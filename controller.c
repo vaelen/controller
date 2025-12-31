@@ -1375,7 +1375,7 @@ rtems_task status_task(rtems_task_argument arg) {
         }
 
         if (location_valid) {
-            LOG_INFO("STATUS", "GPS Pos: %.6f, %.6f, %.0fm",
+            LOG_INFO("STATUS", "GPS Pos: %.4f, %.4f, %.0fm",
                      location.lat_rad * SGP4_RAD_TO_DEG,
                      location.lon_rad * SGP4_RAD_TO_DEG,
                      location.alt_km * 1000.0);
@@ -1533,7 +1533,7 @@ rtems_task controller_task(rtems_task_argument arg) {
                 log_set_time(gps_msg.utc_time);
 
                 if (log_location) {
-                    LOG_INFO("CTRL", "GPS: lat=%.6f deg lon=%.6f deg alt=%.2f km",
+                    LOG_INFO("CTRL", "GPS: lat=%.4f deg lon=%.4f deg alt=%.2f km",
                              gps_msg.location.lat_rad * SGP4_RAD_TO_DEG,
                              gps_msg.location.lon_rad * SGP4_RAD_TO_DEG,
                              gps_msg.location.alt_km);

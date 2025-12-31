@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <math.h>
 
 /*
  * Internal helper functions
@@ -71,6 +72,9 @@ static double nmea_parse_coord(const char *value, const char *dir) {
     if (*dir == 'S' || *dir == 'W') {
         decimal_deg = -decimal_deg;
     }
+
+    // Truncate to 4 decimal places
+    decimal_deg = floor(decimal_deg * 10000.0) / 10000.0;
 
     return decimal_deg;
 }
