@@ -4,7 +4,7 @@
  * Provides missing OpenSSL functions that are referenced but not
  * implemented in the rtems-libbsd OpenSSL port.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

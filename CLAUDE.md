@@ -196,7 +196,7 @@ All new source files must include the following copyright header:
 /*
  * [File description]
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 ```

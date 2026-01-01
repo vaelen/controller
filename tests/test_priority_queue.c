@@ -5,7 +5,7 @@
  * Compile with: gcc -std=c99 -Wall -Wextra -I.. -o test_priority_queue \
  *               test_priority_queue.c ../priority_queue.c
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

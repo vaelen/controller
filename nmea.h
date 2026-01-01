@@ -5,7 +5,7 @@
  * Supports GGA (position) and RMC (date/time) sentences
  * from all GNSS constellations (GP, GN, GA, GB, GL, GQ).
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

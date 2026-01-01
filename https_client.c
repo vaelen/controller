@@ -4,7 +4,7 @@
  * Provides simple HTTPS GET functionality for embedded RTEMS systems.
  * Uses OpenSSL's BIO and SSL APIs for TLS connections.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

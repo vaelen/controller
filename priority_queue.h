@@ -5,7 +5,7 @@
  * Prioritizes passes by start time for non-overlapping passes,
  * and by maximum elevation for overlapping passes.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

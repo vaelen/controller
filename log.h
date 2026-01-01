@@ -1,7 +1,7 @@
 /*
  * Logging utilities for RTEMS satellite tracking controller.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

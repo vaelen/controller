@@ -5,7 +5,7 @@
  * Designed for embedded systems with streaming support to handle
  * large responses without excessive memory allocation.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

@@ -1,7 +1,7 @@
 /*
  * SGP4/SDP4 Satellite Propagation Library - Implementation
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  *
  * Based on the Vallado reference implementation from CelesTrak.
@@ -1686,4 +1686,102 @@ void sgp4_look_angles(const sgp4_vec3_t* sat_ecef, const sgp4_geodetic_t* observ
     if (angles->azimuth_rad < 0.0) {
         angles->azimuth_rad += SGP4_TWO_PI;
     }
+}
+
+// ============================================================================
+// Doppler Calculations
+// ============================================================================
+
+void sgp4_eci_velocity_to_ecef(const sgp4_vec3_t *vel_eci,
+                               const sgp4_vec3_t *sat_ecef,
+                               double gst,
+                               sgp4_vec3_t *vel_ecef_out)
+{
+    double cos_gst = cos(gst);
+    double sin_gst = sin(gst);
+
+    // v_ecef = R * v_eci - omega x r_ecef
+    // The omega x r_ecef term accounts for Earth's rotation
+    vel_ecef_out->x = cos_gst * vel_eci->x + sin_gst * vel_eci->y + SGP4_OMEGA_EARTH * sat_ecef->y;
+    vel_ecef_out->y = -sin_gst * vel_eci->x + cos_gst * vel_eci->y - SGP4_OMEGA_EARTH * sat_ecef->x;
+    vel_ecef_out->z = vel_eci->z;
+}
+
+double sgp4_calculate_doppler_factor(const sgp4_vec3_t *sat_ecef,
+                                     const sgp4_vec3_t *sat_vel_ecef,
+                                     const sgp4_vec3_t *obs_ecef,
+                                     double *range_rate_out)
+{
+    // Calculate range vector (observer to satellite)
+    sgp4_vec3_t range_vec;
+    range_vec.x = sat_ecef->x - obs_ecef->x;
+    range_vec.y = sat_ecef->y - obs_ecef->y;
+    range_vec.z = sat_ecef->z - obs_ecef->z;
+
+    // Normalize range vector to get unit vector
+    double range_mag = sgp4_vec3_magnitude(&range_vec);
+    if (range_mag < 0.001) {
+        // Degenerate case - satellite at observer
+        if (range_rate_out) *range_rate_out = 0.0;
+        return 1.0;
+    }
+
+    sgp4_vec3_t range_unit;
+    range_unit.x = range_vec.x / range_mag;
+    range_unit.y = range_vec.y / range_mag;
+    range_unit.z = range_vec.z / range_mag;
+
+    // Range rate = dot product of velocity and unit range vector
+    // Positive means moving away, negative means approaching
+    double range_rate = sgp4_vec3_dot(sat_vel_ecef, &range_unit);
+
+    if (range_rate_out) *range_rate_out = range_rate;
+
+    // Doppler factor: approaching (negative range_rate) increases frequency
+    return 1.0 - (range_rate / SGP4_C_KM_S);
+}
+
+sgp4_error_t sgp4_calculate_tracking_data(const sgp4_state_t *sat_state,
+                                          const sgp4_geodetic_t *observer,
+                                          double jd,
+                                          sgp4_look_angles_t *angles_out,
+                                          double *doppler_factor_out,
+                                          double *range_rate_out)
+{
+    // Calculate minutes since TLE epoch
+    double epoch_jd = sat_state->jdsatepoch + sat_state->jdsatepochF;
+    double tsince_min = (jd - epoch_jd) * 1440.0;
+
+    // Propagate satellite position and velocity
+    sgp4_result_t result;
+    sgp4_error_t err = sgp4_propagate(sat_state, tsince_min, &result);
+    if (err != SGP4_SUCCESS) {
+        return err;
+    }
+
+    // Get Greenwich Sidereal Time
+    double gst = sgp4_gstime(jd);
+
+    // Convert satellite position ECI to ECEF
+    sgp4_vec3_t sat_eci = { result.r[0], result.r[1], result.r[2] };
+    sgp4_vec3_t sat_ecef;
+    sgp4_eci_to_ecef(&sat_eci, gst, &sat_ecef);
+
+    // Calculate look angles
+    sgp4_look_angles(&sat_ecef, observer, angles_out);
+
+    // Convert satellite velocity ECI to ECEF
+    sgp4_vec3_t vel_eci = { result.v[0], result.v[1], result.v[2] };
+    sgp4_vec3_t vel_ecef;
+    sgp4_eci_velocity_to_ecef(&vel_eci, &sat_ecef, gst, &vel_ecef);
+
+    // Convert observer to ECEF
+    sgp4_vec3_t obs_ecef;
+    sgp4_geodetic_to_ecef(observer, &obs_ecef);
+
+    // Calculate Doppler factor
+    *doppler_factor_out = sgp4_calculate_doppler_factor(&sat_ecef, &vel_ecef, &obs_ecef,
+                                                         range_rate_out);
+
+    return SGP4_SUCCESS;
 }

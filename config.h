@@ -4,7 +4,7 @@
  * Provides INI-style configuration file parsing and runtime reload support.
  * Configuration is stored on SD card at /mnt/sd/config.ini.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

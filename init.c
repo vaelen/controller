@@ -1,7 +1,7 @@
 /*
  * RTEMS Configuration for Satellite Tracking Controller
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

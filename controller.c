@@ -12,7 +12,7 @@
  *   - Pass Executor Task: Controls rotator and radio during satellite passes
  *   - Controller Task: Coordinates passes and commands antenna
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 
@@ -29,12 +29,20 @@
 #include <termios.h>
 #include <unistd.h>
 #include <math.h>
+#include <dirent.h>
 
 #include "sgp4.h"
 #include "nmea.h"
 #include "log.h"
 #include "config.h"
 #include "https_client.h"
+
+#include "shared.h"
+#include "serial.h"
+#include "gps.h"
+#include "rotator.h"
+#include "radio.h"
+#include "pass.h"
 
 #include <sys/stat.h>
 #include <rtems/dosfs.h>
@@ -57,284 +65,37 @@
 #include <rtems/dhcpcd.h>
 
 // ============================================================================
-// Configuration Constants
+// Global Variable Definitions (exported via shared.h)
 // ============================================================================
 
-#define MAX_SATELLITES CONFIG_MAX_NORAD_IDS
-
-// TLE file paths
-#define TLE_FILE_PATH       "/mnt/sd/sats.tle"
-#define TLE_TEMP_FILE_PATH  "/mnt/sd/sats.tle.tmp"
-
-// ============================================================================
-// Message Types
-// ============================================================================
-
-typedef enum message_type {
-    MSG_GPS_UPDATE,
-    MSG_TLE_DATABASE_UPDATED,
-    MSG_PASS_CALCULATED,
-    MSG_ANTENNA_POSITION,
-    MSG_COMMAND_ANTENNA,
-    MSG_RADIO_STATUS,
-    MSG_CONFIG_RELOAD
-} message_type_t;
-
-// Radio operating mode enum (Yaesu FT-991A CAT protocol)
-typedef enum radio_mode {
-    RADIO_MODE_LSB      = 0x1,
-    RADIO_MODE_USB      = 0x2,
-    RADIO_MODE_CW       = 0x3,
-    RADIO_MODE_FM       = 0x4,
-    RADIO_MODE_AM       = 0x5,
-    RADIO_MODE_RTTY_LSB = 0x6,
-    RADIO_MODE_CW_R     = 0x7,
-    RADIO_MODE_DATA_LSB = 0x8,
-    RADIO_MODE_RTTY_USB = 0x9,
-    RADIO_MODE_DATA_FM  = 0xA,
-    RADIO_MODE_FM_N     = 0xB,
-    RADIO_MODE_DATA_USB = 0xC,
-    RADIO_MODE_AM_N     = 0xD,
-    RADIO_MODE_C4FM     = 0xE
-} radio_mode_t;
-
-// Radio pre-amp setting
-typedef enum radio_preamp {
-    RADIO_PREAMP_IPO  = 0,
-    RADIO_PREAMP_AMP1 = 1,
-    RADIO_PREAMP_AMP2 = 2
-} radio_preamp_t;
-
-// Bitmask for which fields are valid in a radio status message
-#define RADIO_FIELD_VFO_A_FREQ  (1 << 0)
-#define RADIO_FIELD_VFO_B_FREQ  (1 << 1)
-#define RADIO_FIELD_AF_GAIN     (1 << 2)
-#define RADIO_FIELD_RF_GAIN     (1 << 3)
-#define RADIO_FIELD_MIC_GAIN    (1 << 4)
-#define RADIO_FIELD_MODE        (1 << 5)
-#define RADIO_FIELD_PREAMP      (1 << 6)
-#define RADIO_FIELD_ACTIVE_VFO  (1 << 7)
-
-// Radio status message (partial updates supported via valid_fields bitmask)
-typedef struct radio_status_message {
-    message_type_t type;
-    uint8_t valid_fields;     // Bitmask of RADIO_FIELD_* indicating which fields are valid
-    uint64_t vfo_a_freq_hz;
-    uint64_t vfo_b_freq_hz;
-    uint8_t af_gain;          // 0-255
-    uint8_t rf_gain;          // 0-255
-    uint8_t mic_gain;         // 0-100
-    radio_mode_t mode;
-    radio_preamp_t preamp;
-    uint8_t active_vfo;       // 0=VFO-A, 1=VFO-B
-} radio_status_message_t;
-
-// Pass information is now defined in priority_queue.h
-// (pass_info_t no longer includes plan steps - those are generated on-the-fly by executor)
-#include "priority_queue.h"
-
-// GPS position and time update message
-typedef struct gps_message {
-    message_type_t type;
-    sgp4_geodetic_t location;
-    time_t utc_time;
-} gps_message_t;
-
-// Antenna current position message
-typedef struct antenna_position_message {
-    message_type_t type;
-    double azimuth;    // radians
-    double elevation;  // radians
-} antenna_position_message_t;
-
-// Antenna command message
-typedef struct antenna_command_message {
-    message_type_t type;
-    double target_azimuth;    // radians
-    double target_elevation;  // radians
-} antenna_command_message_t;
-
-// Pass notification message
-typedef struct pass_message {
-    message_type_t type;
-    pass_info_t pass;
-} pass_message_t;
-
-// TLE update notification (simple flag)
-typedef struct tle_update_message {
-    message_type_t type;
-} tle_update_message_t;
-
-// Union of all message types for queue sizing
-typedef union controller_message {
-    message_type_t type;
-    gps_message_t gps;
-    antenna_position_message_t antenna_pos;
-    antenna_command_message_t antenna_cmd;
-    pass_message_t pass;
-    tle_update_message_t tle_update;
-} controller_message_t;
-
-// Controller command message (for config reload, etc.)
-typedef struct ctrl_cmd_message {
-    message_type_t type;
-} ctrl_cmd_message_t;
-
-// ============================================================================
-// Pass Executor Command Types
-// ============================================================================
-
-// Commands sent from controller to pass executor
-typedef enum executor_command_type {
-    EXEC_CMD_START_PASS,       // Begin tracking a satellite pass
-    EXEC_CMD_ABORT_PASS        // Abort the current pass
-} executor_command_type_t;
-
-// Message from controller to pass executor
-typedef struct executor_command_message {
-    executor_command_type_t command;
-    pass_info_t pass;          // Only valid for EXEC_CMD_START_PASS
-} executor_command_message_t;
-
-// ============================================================================
-// Rotator Command Types
-// ============================================================================
-
-// Commands sent from pass executor to rotator command task
-typedef enum rotator_command_type {
-    ROT_CMD_GOTO,              // Move to specified az/el
-    ROT_CMD_STOP,              // Stop movement
-    ROT_CMD_PARK               // Return to park position (az=0, el=0)
-} rotator_command_type_t;
-
-// Message from pass executor to rotator command task
-typedef struct rotator_command_message {
-    rotator_command_type_t command;
-    double target_azimuth_rad;    // For ROT_CMD_GOTO
-    double target_elevation_rad;  // For ROT_CMD_GOTO
-} rotator_command_message_t;
-
-// ============================================================================
-// Pass Executor State
-// ============================================================================
-
-typedef enum executor_state {
-    EXEC_STATE_IDLE,           // No pass in progress
-    EXEC_STATE_PREPOSITIONING, // Moving antenna to AOS position
-    EXEC_STATE_WAITING_AOS,    // Antenna positioned, waiting for AOS
-    EXEC_STATE_TRACKING,       // Active satellite tracking
-    EXEC_STATE_COMPLETING      // Pass ending, cleanup
-} executor_state_t;
-
-typedef struct executor_tracking_state {
-    // Current state machine position
-    executor_state_t state;
-
-    // Pass being executed
-    pass_info_t current_pass;
-
-    // Satellite SGP4 state (copied from TLE database at pass start)
-    sgp4_state_t sat_state;
-    bool sat_state_valid;
-
-    // Satellite name for display
-    char sat_name[SGP4_TLE_NAME_LEN];
-
-    // Last commanded rotator position (radians)
-    double last_cmd_azimuth_rad;
-    double last_cmd_elevation_rad;
-    bool rotator_commanded;
-
-    // Current calculated satellite position (radians)
-    double current_azimuth_rad;
-    double current_elevation_rad;
-    double current_range_km;
-
-    // Doppler tracking state
-    double last_doppler_factor;    // Last applied doppler factor (ratio)
-    bool doppler_valid;
-
-    // Velocity components for doppler calculation (km/s)
-    double range_rate_km_s;        // Radial velocity toward/away from observer
-} executor_tracking_state_t;
-
-// Global executor state
-static executor_tracking_state_t g_executor_state;
-
-// ============================================================================
-// Pass Scheduling State
-// ============================================================================
-
-// Currently scheduled pass (waiting to execute or in-progress)
-typedef struct scheduled_pass {
-    bool active;               // True if a pass is scheduled
-    pass_info_t pass;          // The scheduled pass
-    bool prep_sent;            // True if start command sent to executor
-} scheduled_pass_t;
-
-// ============================================================================
-// Satellite entry for TLE database
-// ============================================================================
-
-typedef struct satellite_entry {
-    bool valid;
-    sgp4_tle_t tle;
-    sgp4_state_t state;
-} satellite_entry_t;
-
-// ============================================================================
-// Shared State (protected by mutexes)
-// ============================================================================
-
-typedef struct controller_state {
-    // Observer location from GPS
-    sgp4_geodetic_t observer_location;
-    bool location_valid;
-
-    // Current time from GPS
-    time_t current_time;
-    bool time_valid;
-
-    // TLE database (fixed-size array instead of std::map)
-    satellite_entry_t satellites[MAX_SATELLITES];
-    int satellite_count;
-
-    // Current antenna position
-    double antenna_azimuth;    // radians
-    double antenna_elevation;  // radians
-    bool antenna_position_valid;
-
-    // Radio state
-    uint64_t radio_vfo_a_freq_hz;
-    uint64_t radio_vfo_b_freq_hz;
-    uint8_t radio_af_gain;
-    uint8_t radio_rf_gain;
-    uint8_t radio_mic_gain;
-    radio_mode_t radio_mode;
-    radio_preamp_t radio_preamp;
-    uint8_t radio_active_vfo;
-    bool radio_status_valid;
-} controller_state_t;
-
-static controller_state_t g_state;
-
-// ============================================================================
-// IPC Object IDs
-// ============================================================================
+// Global state structures
+controller_state_t g_state;
+executor_tracking_state_t g_executor_state;
+pass_priority_queue_t g_upcoming_passes;
+scheduled_pass_t g_scheduled_pass;
 
 // Message queues
-static rtems_id g_gps_queue;
-static rtems_id g_antenna_queue;
-static rtems_id g_tle_queue;
-static rtems_id g_pass_queue;
+rtems_id g_gps_queue;
+rtems_id g_antenna_queue;
+rtems_id g_tle_queue;
+rtems_id g_pass_queue;
+rtems_id g_radio_queue;
+rtems_id g_ctrl_cmd_queue;
+rtems_id g_executor_cmd_queue;
+rtems_id g_rotator_cmd_queue;
 
 // Semaphores (mutexes)
-static rtems_id g_uart1_mutex;
-static rtems_id g_tle_database_mutex;
-static rtems_id g_state_mutex;
-static rtems_id g_pass_queue_mutex;
+rtems_id g_uart1_mutex;
+rtems_id g_uart3_mutex;
+rtems_id g_tle_database_mutex;
+rtems_id g_state_mutex;
+rtems_id g_pass_queue_mutex;
 
-// Task IDs
+// Shared file descriptors
+int g_rotator_fd = -1;
+int g_radio_fd = -1;
+
+// Task IDs (local to controller.c)
 static rtems_id g_gps_task_id;
 static rtems_id g_antenna_task_id;
 static rtems_id g_tle_task_id;
@@ -342,140 +103,14 @@ static rtems_id g_pass_task_id;
 static rtems_id g_pass_executor_task_id;
 static rtems_id g_controller_task_id;
 static rtems_id g_rotator_status_task_id;
-
-// Rotator file descriptor (shared by antenna_location_task and rotator_status_task)
-static int g_rotator_fd = -1;
-
-// Radio IPC objects
-static rtems_id g_radio_queue;
-static rtems_id g_uart3_mutex;
 static rtems_id g_radio_status_task_id;
 static rtems_id g_radio_freq_task_id;
-static int g_radio_fd = -1;
-
-// Controller command queue (for config reload, etc.)
-static rtems_id g_ctrl_cmd_queue;
-
-// Pass executor command queue (controller -> executor)
-static rtems_id g_executor_cmd_queue;
-
-// Rotator command queue (executor -> rotator command task)
-static rtems_id g_rotator_cmd_queue;
 static rtems_id g_rotator_cmd_task_id;
-
-// Pass priority queue and scheduling state
-static pass_priority_queue_t g_upcoming_passes;
-static scheduled_pass_t g_scheduled_pass;
-
-// Status task
 static rtems_id g_status_task_id;
 
 // ============================================================================
-// Task Priorities and Stack Sizes
+// Utility Functions
 // ============================================================================
-
-#define PRIORITY_PASS_EXECUTOR  10
-#define PRIORITY_CONTROLLER     20
-#define PRIORITY_ROTATOR_CMD    25
-#define PRIORITY_ROTATOR_STATUS 30
-#define PRIORITY_RADIO_STATUS   35
-#define PRIORITY_RADIO_FREQ     36
-#define PRIORITY_ANTENNA        40
-#define PRIORITY_GPS            50
-#define PRIORITY_PASS           60
-#define PRIORITY_TLE            70
-#define PRIORITY_STATUS         80
-
-#define TASK_STACK_SIZE     (8 * 1024)
-#define TLE_TASK_STACK_SIZE (32 * 1024)  /* OpenSSL needs more stack */
-
-// ============================================================================
-// Serial Port Initialization
-// ============================================================================
-
-/*
- * Initialize a serial port with the specified settings.
- *
- * @param path          Device path (e.g., "/dev/ttyS0")
- * @param baud          Baud rate (e.g., B9600, B115200)
- * @param flags         Open flags (O_RDONLY, O_WRONLY, or O_RDWR)
- * @param flow_control  Enable CTS/RTS hardware flow control
- * @return              File descriptor on success, -1 on failure
- */
-static int serial_init(const char *path, speed_t baud, int flags, bool flow_control) {
-    int fd = open(path, flags | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) {
-        LOG_ERROR("SERIAL", "Failed to open serial port %s, Error: %s", path, strerror(errno));
-        return -1;
-    }
-
-    struct termios tty;
-    if (tcgetattr(fd, &tty) != 0) {
-        LOG_ERROR("SERIAL", "Failed to get attributes for serial port %s, Error: %s", path, strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    /* Set baud rate */
-    cfsetispeed(&tty, baud);
-    cfsetospeed(&tty, baud);
-
-    /* 8N1 mode */
-    tty.c_cflag &= ~PARENB;        /* No parity */
-    tty.c_cflag &= ~CSTOPB;        /* 1 stop bit */
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;            /* 8 data bits */
-
-    /* Hardware flow control */
-    if (flow_control) {
-        tty.c_cflag |= CRTSCTS;
-    } else {
-        tty.c_cflag &= ~CRTSCTS;
-    }
-
-    /* Ignore modem control lines */
-    tty.c_cflag |= CLOCAL;
-
-    /* Enable receiver if reading (O_RDONLY is 0, so check access mode) */
-    int access_mode = flags & O_ACCMODE;
-    if (access_mode == O_RDONLY || access_mode == O_RDWR) {
-        tty.c_cflag |= CREAD;
-
-        /* Raw input mode */
-        tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-
-        /* Disable input processing that could alter data */
-        tty.c_iflag &= ~(IXON | IXOFF | IXANY);   /* No software flow control */
-        tty.c_iflag &= ~(ICRNL | INLCR | IGNCR);  /* Don't translate CR/LF */
-        tty.c_iflag &= ~(ISTRIP | BRKINT);        /* Don't strip 8th bit, ignore break */
-
-        /* Non-blocking: return immediately even with no data */
-        tty.c_cc[VMIN] = 0;
-        tty.c_cc[VTIME] = 0;
-    }
-
-    /* Raw output mode */
-    tty.c_oflag &= ~OPOST;
-
-    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        LOG_ERROR("SERIAL", "Failed to set attributes for serial port %s, Error: %s", path, strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    return fd;
-}
-
-/*
- * Initialize a serial port from configuration.
- * Returns file descriptor on success, -1 on failure.
- */
-static int serial_init_from_config(const serial_config_t *cfg) {
-    return serial_init(cfg->device_path, cfg->baud_rate,
-                       O_RDWR, cfg->flow_control);
-}
-
-#include <dirent.h>
 
 /*
  * List contents of a directory for debugging purposes.
@@ -495,6 +130,10 @@ static void list_directory(const char *path) {
     }
     closedir(dir);
 }
+
+// ============================================================================
+// SD Card Initialization
+// ============================================================================
 
 /*
  * Initialize libbsd and wait for SD card device.
@@ -815,7 +454,7 @@ static void network_configure_ipv6_static(const network_config_t *cfg)
 
     /* Add default gateway if specified */
     if (cfg->ipv6.gateway[0] != '\0') {
-        char *route_default_argv[] = {
+        char *route_argv[] = {
             "route",
             "add",
             "-inet6",
@@ -824,135 +463,74 @@ static void network_configure_ipv6_static(const network_config_t *cfg)
             NULL
         };
 
-        rtems_bsd_command_route(5, route_default_argv);
+        rtems_bsd_command_route(5, route_argv);
         LOG_INFO("NET", "IPv6 gateway: %s", cfg->ipv6.gateway);
     }
 }
 
 /*
- * Create /etc/resolv.conf with fallback DNS servers.
- * dhcpcd may override this with DHCP-provided servers, but if DNS
- * information isn't provided by DHCP, these fallbacks will be used.
- */
-static void network_create_resolv_conf(void)
-{
-    /* Create /etc directory if it doesn't exist */
-    mkdir("/etc", 0755);
-
-    int fd = open("/etc/resolv.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd < 0) {
-        LOG_ERROR("NET", "Cannot create /etc/resolv.conf: %s", strerror(errno));
-        return;
-    }
-
-    /* Write fallback DNS servers */
-    const char *resolv_conf =
-        "# Fallback DNS servers for satellite tracking controller\n"
-        "# These may be overwritten by dhcpcd if DHCP provides DNS servers\n"
-        "nameserver 1.1.1.1\n"
-        "nameserver 8.8.8.8\n"
-        "nameserver 2606:4700:4700::1111\n"
-        "nameserver 2001:4860:4860::8888\n";
-
-    write(fd, resolv_conf, strlen(resolv_conf));
-    close(fd);
-
-    LOG_DEBUG("NET", "Created /etc/resolv.conf with fallback DNS servers");
-}
-
-/*
- * Start dhcpcd daemon for DHCP/SLAAC.
+ * Start dhcpcd daemon for DHCP/SLAAC configuration.
  */
 static void network_start_dhcpcd(const network_config_t *cfg)
 {
-    rtems_status_code sc;
+    /* Build dhcpcd options based on configuration */
+    const char *argv[8];
+    int argc = 0;
 
-    /* Create /etc directory if it doesn't exist */
-    mkdir("/etc", 0755);
+    argv[argc++] = "dhcpcd";
 
-    /* Create dhcpcd configuration file */
-    int fd = open("/etc/dhcpcd.conf", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd < 0) {
-        LOG_ERROR("NET", "Cannot create /etc/dhcpcd.conf: %s", strerror(errno));
-        return;
+    /* Interface to configure */
+    argv[argc++] = cfg->interface;
+
+    /* If only IPv4, disable IPv6 in dhcpcd */
+    if (!cfg->ipv6.enabled || (!cfg->ipv6.dhcp && !cfg->ipv6.slaac)) {
+        argv[argc++] = "-4";  /* IPv4 only */
     }
 
-    /* Write configuration based on settings */
-    const char *header = "# Auto-generated dhcpcd configuration\n";
-    write(fd, header, strlen(header));
-
-    /* Client ID for DHCP */
-    const char *clientid = "clientid sattrack-controller\n";
-    write(fd, clientid, strlen(clientid));
-
-    /* Interface-specific configuration */
-    char iface_line[64];
-    snprintf(iface_line, sizeof(iface_line), "interface %s\n", cfg->interface);
-    write(fd, iface_line, strlen(iface_line));
-
-    /* Control IPv4 DHCP */
+    /* If only IPv6, disable IPv4 in dhcpcd */
     if (!cfg->ipv4.enabled || !cfg->ipv4.dhcp) {
-        const char *nodhcp = "nodhcp\n";
-        write(fd, nodhcp, strlen(nodhcp));
+        argv[argc++] = "-6";  /* IPv6 only */
     }
 
-    /* Control IPv6 DHCPv6 */
-    if (!cfg->ipv6.enabled || !cfg->ipv6.dhcp) {
-        const char *nodhcp6 = "nodhcp6\n";
-        write(fd, nodhcp6, strlen(nodhcp6));
-    }
+    argv[argc] = NULL;
 
-    /* Control SLAAC - dhcpcd handles SLAAC by default when IPv6 is enabled */
-    if (!cfg->ipv6.enabled || !cfg->ipv6.slaac) {
-        const char *noipv6rs = "noipv6rs\n";
-        write(fd, noipv6rs, strlen(noipv6rs));
-    }
-
-    close(fd);
-
-    /* Start dhcpcd */
     LOG_INFO("NET", "Starting dhcpcd...");
-    sc = rtems_dhcpcd_start(NULL);
-    if (sc != RTEMS_SUCCESSFUL) {
-        LOG_ERROR("NET", "Failed to start dhcpcd: %d", sc);
-    }
+    rtems_dhcpcd_start(NULL);
+
+    /* dhcpcd runs in background, wait briefly for it to get an address */
+    rtems_task_wake_after(3 * rtems_clock_get_ticks_per_second());
 }
 
 /*
- * Get current network interface addresses for status display.
- * Populates ipv4_addr and ipv6_addr buffers with current addresses.
+ * Get current IP addresses for an interface.
+ * Fills ipv4_addr and ipv6_addr buffers with addresses (empty string if none).
  */
-static void network_get_addresses(const char *ifname,
-                                   char *ipv4_addr, size_t ipv4_len,
-                                   char *ipv6_addr, size_t ipv6_len)
+void network_get_addresses(const char *ifname,
+                           char *ipv4_addr, size_t ipv4_size,
+                           char *ipv6_addr, size_t ipv6_size)
 {
-    struct ifaddrs *ifap, *ifa;
-
     ipv4_addr[0] = '\0';
     ipv6_addr[0] = '\0';
 
+    struct ifaddrs *ifap;
     if (getifaddrs(&ifap) != 0) {
         return;
     }
 
-    for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
-        if (strcmp(ifa->ifa_name, ifname) != 0) {
-            continue;
-        }
-
-        if (ifa->ifa_addr == NULL) {
+    for (struct ifaddrs *ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+        if (strcmp(ifa->ifa_name, ifname) != 0 || ifa->ifa_addr == NULL) {
             continue;
         }
 
         if (ifa->ifa_addr->sa_family == AF_INET && ipv4_addr[0] == '\0') {
             struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-            inet_ntop(AF_INET, &sin->sin_addr, ipv4_addr, ipv4_len);
+            inet_ntop(AF_INET, &sin->sin_addr, ipv4_addr, ipv4_size);
         }
         else if (ifa->ifa_addr->sa_family == AF_INET6 && ipv6_addr[0] == '\0') {
             struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-            /* Skip link-local addresses for display */
+            /* Skip link-local addresses (fe80::) for display */
             if (!IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
-                inet_ntop(AF_INET6, &sin6->sin6_addr, ipv6_addr, ipv6_len);
+                inet_ntop(AF_INET6, &sin6->sin6_addr, ipv6_addr, ipv6_size);
             }
         }
     }
@@ -962,61 +540,36 @@ static void network_get_addresses(const char *ifname,
 
 /*
  * Initialize networking based on configuration.
- * Must be called after rtems_bsd_initialize() and before tasks start.
  * Returns true on success, false on failure.
  */
-static bool network_init(const network_config_t *cfg)
+bool network_init(const network_config_t *cfg)
 {
-    int exit_code;
-
     if (!cfg->enabled) {
         LOG_INFO("NET", "Networking disabled in configuration");
         return true;
     }
 
-    LOG_INFO("NET", "Initializing network interface %s...", cfg->interface);
+    LOG_INFO("NET", "Initializing network on %s", cfg->interface);
 
-    /* Create resolv.conf with fallback DNS servers */
-    network_create_resolv_conf();
-
-    /* Configure loopback interface first */
-    exit_code = rtems_bsd_ifconfig_lo0();
-    if (exit_code != 0) {
-        LOG_WARN("NET", "Failed to configure loopback interface: %d", exit_code);
-    }
-
-    /* Wait for the Ethernet interface to appear */
+    /* Wait for the interface to appear (up to 10 seconds) */
     if (!network_wait_for_interface(cfg->interface, 10)) {
-        LOG_ERROR("NET", "Network interface %s not found", cfg->interface);
+        LOG_ERROR("NET", "Interface %s not found", cfg->interface);
         return false;
     }
 
     /* Bring up the interface */
-    char *ifup_argv[] = {
-        "ifconfig",
-        (char *)cfg->interface,
-        "up",
-        NULL
-    };
-    rtems_bsd_command_ifconfig(3, ifup_argv);
+    char *ifcfg_argv[] = { "ifconfig", (char *)cfg->interface, "up", NULL };
+    rtems_bsd_command_ifconfig(3, ifcfg_argv);
 
-    /* Configure IPv4 */
-    if (cfg->ipv4.enabled) {
-        if (cfg->ipv4.dhcp) {
-            LOG_INFO("NET", "IPv4: Using DHCP");
-        } else if (cfg->ipv4.address[0] != '\0') {
+    /* Configure static addresses if specified */
+    if (cfg->ipv4.enabled && !cfg->ipv4.dhcp) {
+        if (cfg->ipv4.address[0] != '\0') {
             network_configure_ipv4_static(cfg);
         }
     }
 
-    /* Configure IPv6 */
-    if (cfg->ipv6.enabled) {
-        if (cfg->ipv6.slaac || cfg->ipv6.dhcp) {
-            LOG_INFO("NET", "IPv6: Using %s%s%s",
-                     cfg->ipv6.slaac ? "SLAAC" : "",
-                     (cfg->ipv6.slaac && cfg->ipv6.dhcp) ? "+" : "",
-                     cfg->ipv6.dhcp ? "DHCPv6" : "");
-        } else if (cfg->ipv6.address[0] != '\0') {
+    if (cfg->ipv6.enabled && !cfg->ipv6.dhcp && !cfg->ipv6.slaac) {
+        if (cfg->ipv6.address[0] != '\0') {
             network_configure_ipv6_static(cfg);
         }
     }
@@ -1031,835 +584,8 @@ static bool network_init(const network_config_t *cfg)
 }
 
 // ============================================================================
-// Task Entry Points
+// Status Task
 // ============================================================================
-
-/*
- * GPS Task
- *
- * Receives data from a GPS receiver via UART.
- * Parses NMEA sentences (GGA for position, RMC for date/time).
- * Sends updates to the controller via message queue.
- */
-rtems_task gps_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("GPS", "Task started");
-
-    /* Get current configuration */
-    config_t cfg;
-    config_get_copy(&cfg);
-
-    int fd = serial_init_from_config(&cfg.gps);
-    if (fd < 0) {
-        LOG_ERROR("GPS", "Failed to open GPS port %s", cfg.gps.device_path);
-        rtems_task_exit();
-    }
-
-    LOG_INFO("GPS", "Serial port %s opened successfully", cfg.gps.device_path);
-
-    nmea_buffer_t nmea_buf;
-    nmea_buffer_init(&nmea_buf);
-
-    /* Track latest valid data from each sentence type */
-    nmea_gga_t last_gga = {0};
-    nmea_rmc_t last_rmc = {0};
-
-    char read_buf[64];
-    char line[NMEA_BUFFER_SIZE];
-
-    while (true) {
-        /* Non-blocking read from serial */
-        ssize_t n;
-        n = read(fd, read_buf, sizeof(read_buf) - 1);
-        while (n > 0) {
-            read_buf[n] = '\0';
-            nmea_buffer_add(&nmea_buf, read_buf);
-            n = read(fd, read_buf, sizeof(read_buf) - 1);
-        }
-
-        /* Process complete lines from buffer */
-        while (nmea_buffer_get_line(&nmea_buf, line, sizeof(line))) {
-            /* Strip trailing newline/carriage return */
-            while(line[strlen(line)-1] == '\n' || line[strlen(line)-1] == '\r') {
-                line[strlen(line)-1] = '\0';
-            }
-            // LOG_DEBUG("GPS", "NMEA: %s", line);
-
-            /* Validate checksum before parsing */
-            if (!nmea_validate_checksum(line)) {
-                continue;
-            }
-
-            if (nmea_is_gga(line)) {
-                LOG_DEBUG("GPS", "NMEA GGA: %s", line);
-                nmea_parse_gga(line, &last_gga);
-            } else if (nmea_is_rmc(line)) {
-                LOG_DEBUG("GPS", "NMEA RMC: %s", line);
-                nmea_parse_rmc(line, &last_rmc);
-            }
-
-            /* Send message if we have valid position and date/time */
-            if (last_gga.valid && last_gga.fix_quality > 0 &&
-                last_rmc.valid && last_rmc.date.valid) {
-
-                gps_message_t msg;
-                msg.type = MSG_GPS_UPDATE;
-
-                /* Convert degrees to radians, meters to km */
-                msg.location.lat_rad = last_gga.lat_deg * SGP4_DEG_TO_RAD;
-                msg.location.lon_rad = last_gga.lon_deg * SGP4_DEG_TO_RAD;
-                msg.location.alt_km = last_gga.alt_m / 1000.0;
-
-                /* Build time_t from RMC date + GGA time (UTC) */
-                struct tm tm_time;
-                memset(&tm_time, 0, sizeof(tm_time));
-                tm_time.tm_year = last_rmc.date.year - 1900;
-                tm_time.tm_mon = last_rmc.date.month - 1;
-                tm_time.tm_mday = last_rmc.date.day;
-                tm_time.tm_hour = last_gga.time.hour;
-                tm_time.tm_min = last_gga.time.minute;
-                tm_time.tm_sec = (int)last_gga.time.second;
-                tm_time.tm_isdst = 0;
-
-                /* Use mktime (assumes UTC in RTEMS without timezone config) */
-                msg.utc_time = mktime(&tm_time);
-
-                rtems_message_queue_send(g_gps_queue, &msg, sizeof(msg));
-            }
-        }
-
-        /* Yield to other tasks (poll at ~10 Hz) */
-        rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(100));
-    }
-}
-
-/*
- * Antenna Location Task
- *
- * Sends periodic position query commands to the antenna rotator.
- * Uses GS-232A protocol: "C2\r" requests azimuth and elevation.
- * The rotator_status_task handles parsing responses.
- */
-rtems_task antenna_location_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("ANTENNA", "Location task started");
-
-    while (true) {
-
-        // Acquire mutex before UART access
-        rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-
-        // Send C2 query command to rotator
-        if (g_rotator_fd >= 0) {
-            const char *cmd = "C2\r";
-            write(g_rotator_fd, cmd, 3);
-            fsync(g_rotator_fd);
-            LOG_DEBUG("ROTATOR", "Sent command: %s", cmd);
-        }
-
-        rtems_semaphore_release(g_uart1_mutex);
-
-        // Poll every 2 seconds
-        rtems_task_wake_after(2 * rtems_clock_get_ticks_per_second());
-    }
-}
-
-/*
- * Rotator Status Task
- *
- * Listens for status responses from the rotator (GS-232A protocol).
- * Parses "+0aaa+0eee\r" format (azimuth first, then elevation).
- * Sends antenna_position_message_t to controller via message queue.
- */
-rtems_task rotator_status_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("ROTATOR", "Status task started");
-
-    char buf[32];
-    int buf_pos = 0;
-
-    while (true) {
-        // Acquire mutex before UART access
-        rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-
-        // Non-blocking read from rotator
-        if (g_rotator_fd >= 0) {
-            char read_buf[16];
-            ssize_t total_read = 0;
-            ssize_t n = read(g_rotator_fd, read_buf, sizeof(read_buf) - 1);
-            while (n > 0) {
-                total_read += n;
-                // Append to buffer
-                for (ssize_t i = 0; i < n && buf_pos < (int)sizeof(buf) - 1; i++) {
-                    buf[buf_pos++] = read_buf[i];
-                }
-                buf[buf_pos] = '\0';
-                n = read(g_rotator_fd, read_buf, sizeof(read_buf) - 1);
-            }
-            if (total_read > 0)
-                LOG_DEBUG("ROTATOR", "Read %zd bytes from rotator", total_read);
-        }
-
-        rtems_semaphore_release(g_uart1_mutex);
-
-        if (buf_pos == 0) {
-            // No data received, yield and continue
-            rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(50));
-            continue;
-        }
-
-        // Check for complete response (ends with CR)
-        char *cr = strchr(buf, '\r');
-        if (cr != NULL) {
-            *cr = '\0';  // Null-terminate at CR
-
-            // Parse GS-232A format: +0aaa+0eee or +0aaa +0eee
-            // Example: +0180+0045 or +0180 +0045 = 180 deg az, 45 deg el
-            int az_deg = 0, el_deg = 0;
-            if (sscanf(buf, "+0%3d +0%3d", &az_deg, &el_deg) == 2 ||
-                sscanf(buf, "+0%3d+0%3d", &az_deg, &el_deg) == 2 ||
-                sscanf(buf, "%d %d", &az_deg, &el_deg) == 2 ||
-                sscanf(buf, "%d%d", &az_deg, &el_deg) == 2) {
-
-                // Convert degrees to radians and send message
-                antenna_position_message_t msg;
-                msg.type = MSG_ANTENNA_POSITION;
-                msg.azimuth = (double)az_deg * SGP4_DEG_TO_RAD;
-                msg.elevation = (double)el_deg * SGP4_DEG_TO_RAD;
-
-                rtems_message_queue_send(g_antenna_queue, &msg, sizeof(msg));
-                LOG_DEBUG("ROTATOR", "Position: az=%d el=%d deg", az_deg, el_deg);
-            }
-
-            // Reset buffer (shift remaining data if any)
-            int remaining = buf_pos - (int)(cr - buf) - 1;
-            if (remaining > 0) {
-                memmove(buf, cr + 1, remaining);
-                buf_pos = remaining;
-            } else {
-                buf_pos = 0;
-            }
-            buf[buf_pos] = '\0';
-        }
-
-        // Yield to other tasks (poll at ~20 Hz)
-        rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(50));
-    }
-}
-
-/*
- * Radio Frequency Task
- *
- * Sends periodic CAT query commands to the radio to request status.
- * Uses Yaesu FT-991A CAT protocol.
- * The radio_status_task handles parsing responses.
- */
-rtems_task radio_frequency_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("RADIO", "Frequency task started");
-
-    // CAT query commands
-    static const char *queries[] = {
-        "FA;",   // VFO-A frequency
-        "FB;",   // VFO-B frequency
-        "AG0;",  // AF gain
-        "RG0;",  // RF gain
-        "MG;",   // Mic gain
-        "MD0;",  // Mode
-        "PA0;",  // Pre-amp
-        "FT;"    // Active VFO
-    };
-    static const int num_queries = sizeof(queries) / sizeof(queries[0]);
-
-    while (true) {
-        rtems_semaphore_obtain(g_uart3_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-
-        if (g_radio_fd >= 0) {
-            for (int i = 0; i < num_queries; i++) {
-                write(g_radio_fd, queries[i], strlen(queries[i]));
-            }
-            fsync(g_radio_fd);
-            LOG_DEBUG("RADIO", "Sent %d query commands", num_queries);
-        }
-
-        rtems_semaphore_release(g_uart3_mutex);
-
-        // Poll every 2 seconds
-        rtems_task_wake_after(2 * rtems_clock_get_ticks_per_second());
-    }
-}
-
-/*
- * Radio Status Task
- *
- * Listens for CAT responses from the radio (Yaesu FT-991A).
- * Parses responses and sends radio_status_message_t to controller.
- * Supports partial updates via valid_fields bitmask.
- */
-rtems_task radio_status_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("RADIO", "Status task started");
-
-    char buf[128];
-    int buf_pos = 0;
-
-    while (true) {
-        rtems_semaphore_obtain(g_uart3_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-
-        if (g_radio_fd >= 0) {
-            ssize_t total_read = 0;
-            char read_buf[64];
-            ssize_t n = read(g_radio_fd, read_buf, sizeof(read_buf) - 1);
-            while (n > 0) {
-                total_read += n;
-                for (ssize_t i = 0; i < n && buf_pos < (int)sizeof(buf) - 1; i++) {
-                    buf[buf_pos++] = read_buf[i];
-                }
-                buf[buf_pos] = '\0';
-                n = read(g_radio_fd, read_buf, sizeof(read_buf) - 1);
-            }
-            if (total_read > 0)
-                LOG_DEBUG("RADIO", "Read %zd bytes from radio", total_read);
-        }
-
-        rtems_semaphore_release(g_uart3_mutex);
-
-        // Parse complete responses (terminated by ';')
-        // Accumulate fields into a message with valid_fields bitmask
-        radio_status_message_t msg;
-        memset(&msg, 0, sizeof(msg));
-        msg.type = MSG_RADIO_STATUS;
-        msg.valid_fields = 0;
-
-        char *semi;
-        while ((semi = strchr(buf, ';')) != NULL) {
-            *semi = '\0';
-            char *cmd = buf;
-
-            // Parse based on command prefix and set valid_fields bit
-            unsigned long freq;
-            unsigned int val;
-            char mode_char;
-
-            if (sscanf(cmd, "FA%9lu", &freq) == 1) {
-                msg.vfo_a_freq_hz = freq;
-                msg.valid_fields |= RADIO_FIELD_VFO_A_FREQ;
-            } else if (sscanf(cmd, "FB%9lu", &freq) == 1) {
-                msg.vfo_b_freq_hz = freq;
-                msg.valid_fields |= RADIO_FIELD_VFO_B_FREQ;
-            } else if (sscanf(cmd, "AG0%3u", &val) == 1) {
-                msg.af_gain = (uint8_t)val;
-                msg.valid_fields |= RADIO_FIELD_AF_GAIN;
-            } else if (sscanf(cmd, "RG0%3u", &val) == 1) {
-                msg.rf_gain = (uint8_t)val;
-                msg.valid_fields |= RADIO_FIELD_RF_GAIN;
-            } else if (sscanf(cmd, "MG%3u", &val) == 1) {
-                msg.mic_gain = (uint8_t)val;
-                msg.valid_fields |= RADIO_FIELD_MIC_GAIN;
-            } else if (sscanf(cmd, "MD0%c", &mode_char) == 1) {
-                if (mode_char >= '1' && mode_char <= '9')
-                    msg.mode = (radio_mode_t)(mode_char - '0');
-                else if (mode_char >= 'A' && mode_char <= 'E')
-                    msg.mode = (radio_mode_t)(mode_char - 'A' + 10);
-                msg.valid_fields |= RADIO_FIELD_MODE;
-            } else if (sscanf(cmd, "PA0%1u", &val) == 1) {
-                msg.preamp = (radio_preamp_t)val;
-                msg.valid_fields |= RADIO_FIELD_PREAMP;
-            } else if (sscanf(cmd, "FT%1u", &val) == 1) {
-                msg.active_vfo = (uint8_t)val;
-                msg.valid_fields |= RADIO_FIELD_ACTIVE_VFO;
-            }
-
-            // Shift buffer
-            int remaining = buf_pos - (int)(semi - buf) - 1;
-            if (remaining > 0) {
-                memmove(buf, semi + 1, remaining);
-                buf_pos = remaining;
-            } else {
-                buf_pos = 0;
-            }
-            buf[buf_pos] = '\0';
-        }
-
-        // Send message if any fields were parsed
-        if (msg.valid_fields != 0) {
-            rtems_message_queue_send(g_radio_queue, &msg, sizeof(msg));
-            LOG_DEBUG("RADIO", "Parsed fields=0x%02X", msg.valid_fields);
-        }
-
-        // Yield to other tasks (poll at ~20 Hz)
-        rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(50));
-    }
-}
-
-// ============================================================================
-// TLE Stream Parser for Download Filtering
-// ============================================================================
-
-/*
- * Parser states for streaming TLE data.
- */
-typedef enum tle_parser_state {
-    TLE_STATE_NAME = 0,   /* Expecting name line (line 0) */
-    TLE_STATE_LINE1 = 1,  /* Expecting TLE line 1 */
-    TLE_STATE_LINE2 = 2   /* Expecting TLE line 2 */
-} tle_parser_state_t;
-
-/*
- * TLE stream parser context for filtering during download.
- */
-typedef struct tle_stream_parser {
-    char line_buf[256];              /* Buffer for accumulating current line */
-    int line_len;                    /* Current line length */
-    char name_line[SGP4_TLE_NAME_LEN]; /* Satellite name */
-    char line1[SGP4_TLE_LINE_LEN];   /* TLE line 1 */
-    char line2[SGP4_TLE_LINE_LEN];   /* TLE line 2 */
-    tle_parser_state_t state;        /* Current parser state */
-    const int *norad_ids;            /* NORAD IDs to filter (NULL = accept all) */
-    int norad_count;                 /* Number of NORAD IDs in filter */
-    FILE *output_file;               /* File to write filtered TLE data */
-    int total_parsed;                /* Total TLE entries parsed */
-    int matches_found;               /* Number of matching satellites */
-    int max_matches;                 /* Maximum matches to accept */
-} tle_stream_parser_t;
-
-/*
- * Initialize TLE stream parser.
- */
-static void tle_parser_init(tle_stream_parser_t *parser, const int *norad_ids,
-                            int norad_count, FILE *output_file, int max_matches)
-{
-    memset(parser, 0, sizeof(*parser));
-    parser->norad_ids = norad_ids;
-    parser->norad_count = norad_count;
-    parser->output_file = output_file;
-    parser->max_matches = max_matches;
-    parser->state = TLE_STATE_NAME;
-}
-
-/*
- * Check if NORAD ID is in the filter list.
- * Returns true if the ID should be accepted.
- */
-static bool tle_parser_should_accept(const tle_stream_parser_t *parser, int norad_id)
-{
-    /* If no filter list, accept based on max_matches limit */
-    if (parser->norad_ids == NULL || parser->norad_count == 0) {
-        return parser->matches_found < parser->max_matches;
-    }
-
-    /* Check if ID is in the filter list */
-    for (int i = 0; i < parser->norad_count; i++) {
-        if (parser->norad_ids[i] == norad_id) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * Extract NORAD ID from TLE line 1.
- * Line 1 format: "1 NNNNN..." where NNNNN is the 5-digit NORAD ID at columns 3-7.
- */
-static int tle_parser_extract_norad_id(const char *line1)
-{
-    if (strlen(line1) < 7) {
-        return -1;
-    }
-    if (line1[0] != '1') {
-        return -1;
-    }
-
-    /* Extract NORAD ID from columns 3-7 (0-indexed: 2-6) */
-    char id_str[6];
-    memcpy(id_str, &line1[2], 5);
-    id_str[5] = '\0';
-
-    return atoi(id_str);
-}
-
-/*
- * Process a complete TLE entry (name, line1, line2).
- * Returns true if the entry was accepted and written.
- */
-static bool tle_parser_process_entry(tle_stream_parser_t *parser)
-{
-    parser->total_parsed++;
-
-    /* Extract NORAD ID from line 1 */
-    int norad_id = tle_parser_extract_norad_id(parser->line1);
-    if (norad_id < 0) {
-        LOG_DEBUG("TLE", "Invalid TLE line 1: %s", parser->line1);
-        return false;
-    }
-
-    /* Check if we should accept this satellite */
-    if (!tle_parser_should_accept(parser, norad_id)) {
-        return false;
-    }
-
-    /* Write to output file */
-    if (parser->output_file != NULL) {
-        fprintf(parser->output_file, "%s\n%s\n%s\n",
-                parser->name_line, parser->line1, parser->line2);
-    }
-
-    parser->matches_found++;
-    LOG_DEBUG("TLE", "Accepted satellite: %s (NORAD %d), %d/%d",
-              parser->name_line, norad_id, parser->matches_found, parser->max_matches);
-
-    return true;
-}
-
-/*
- * Process a single line from the TLE stream.
- * Called for each complete line received.
- */
-static void tle_parser_process_line(tle_stream_parser_t *parser, const char *line)
-{
-    /* Skip empty lines */
-    size_t len = strlen(line);
-    if (len == 0) {
-        return;
-    }
-
-    /* Determine line type based on first character */
-    if (line[0] == '1' && len >= 69) {
-        /* This is TLE line 1 */
-        if (parser->state == TLE_STATE_NAME) {
-            /* No name line before line 1, use empty name */
-            parser->name_line[0] = '\0';
-        }
-        strncpy(parser->line1, line, SGP4_TLE_LINE_LEN - 1);
-        parser->line1[SGP4_TLE_LINE_LEN - 1] = '\0';
-        parser->state = TLE_STATE_LINE2;
-    }
-    else if (line[0] == '2' && len >= 69) {
-        /* This is TLE line 2 */
-        if (parser->state == TLE_STATE_LINE2) {
-            strncpy(parser->line2, line, SGP4_TLE_LINE_LEN - 1);
-            parser->line2[SGP4_TLE_LINE_LEN - 1] = '\0';
-
-            /* Process complete TLE entry */
-            tle_parser_process_entry(parser);
-        }
-        parser->state = TLE_STATE_NAME;
-    }
-    else {
-        /* This is a name line */
-        strncpy(parser->name_line, line, SGP4_TLE_NAME_LEN - 1);
-        parser->name_line[SGP4_TLE_NAME_LEN - 1] = '\0';
-
-        /* Trim trailing whitespace from name */
-        int name_len = strlen(parser->name_line);
-        while (name_len > 0 && (parser->name_line[name_len - 1] == ' ' ||
-                                 parser->name_line[name_len - 1] == '\r' ||
-                                 parser->name_line[name_len - 1] == '\n')) {
-            parser->name_line[--name_len] = '\0';
-        }
-
-        parser->state = TLE_STATE_LINE1;
-    }
-}
-
-/*
- * Feed data chunk to parser.
- * Handles partial lines across chunks.
- */
-static void tle_parser_feed(tle_stream_parser_t *parser, const char *data, size_t len)
-{
-    for (size_t i = 0; i < len; i++) {
-        char c = data[i];
-
-        if (c == '\n') {
-            /* End of line - process it */
-            parser->line_buf[parser->line_len] = '\0';
-
-            /* Strip trailing CR if present */
-            if (parser->line_len > 0 && parser->line_buf[parser->line_len - 1] == '\r') {
-                parser->line_buf[parser->line_len - 1] = '\0';
-            }
-
-            tle_parser_process_line(parser, parser->line_buf);
-
-            parser->line_len = 0;
-
-            /* Stop if we've reached max matches */
-            if (parser->matches_found >= parser->max_matches) {
-                return;
-            }
-        }
-        else if (parser->line_len < (int)sizeof(parser->line_buf) - 1) {
-            /* Add character to line buffer */
-            parser->line_buf[parser->line_len++] = c;
-        }
-    }
-}
-
-/*
- * HTTPS callback for TLE download.
- * Parses incoming data and filters satellites.
- */
-static bool tle_download_callback(const char *data, size_t len, void *user_data)
-{
-    tle_stream_parser_t *parser = (tle_stream_parser_t *)user_data;
-
-    tle_parser_feed(parser, data, len);
-
-    /* Continue reading unless we've found enough matches */
-    return parser->matches_found < parser->max_matches;
-}
-
-// ============================================================================
-// TLE Database Loading
-// ============================================================================
-
-/*
- * Load TLE database from file into global state.
- * Must be called with g_tle_database_mutex held.
- */
-static int load_tle_database(const char *filepath)
-{
-    FILE *file = fopen(filepath, "r");
-    if (file == NULL) {
-        LOG_DEBUG("TLE", "Cannot open TLE file: %s", filepath);
-        return -1;
-    }
-
-    int count = 0;
-    sgp4_tle_t tle;
-    sgp4_error_t err;
-
-    while ((err = sgp4_read_tle_stream(file, &tle)) == SGP4_SUCCESS && count < MAX_SATELLITES) {
-        /* Convert TLE to SGP4 elements and initialize state */
-        sgp4_elements_t elements;
-        err = sgp4_tle_to_elements(&tle, &elements);
-        if (err != SGP4_SUCCESS) {
-            LOG_WARN("TLE", "Failed to convert TLE for %s: %d", tle.name, err);
-            continue;
-        }
-
-        sgp4_state_t state;
-        err = sgp4_init(&state, &elements);
-        if (err != SGP4_SUCCESS) {
-            LOG_WARN("TLE", "Failed to init SGP4 for %s: %d", tle.name, err);
-            continue;
-        }
-
-        /* Store in database */
-        g_state.satellites[count].valid = true;
-        g_state.satellites[count].tle = tle;
-        g_state.satellites[count].state = state;
-        count++;
-
-        LOG_DEBUG("TLE", "Loaded: %s (NORAD %d)", tle.name, tle.norad_id);
-    }
-
-    fclose(file);
-
-    g_state.satellite_count = count;
-    LOG_INFO("TLE", "Loaded %d satellites from %s", count, filepath);
-
-    return count;
-}
-
-/*
- * Find satellite name by NORAD ID.
- * Must be called with g_tle_database_mutex held.
- * Returns pointer to name string if found, NULL otherwise.
- */
-static const char *find_satellite_name(int norad_id)
-{
-    for (int i = 0; i < g_state.satellite_count; i++) {
-        if (g_state.satellites[i].valid &&
-            g_state.satellites[i].tle.norad_id == norad_id) {
-            return g_state.satellites[i].tle.name;
-        }
-    }
-    return NULL;
-}
-
-/*
- * Check if network is available (has a valid IP address).
- */
-static bool network_is_available(const char *ifname)
-{
-    char ipv4_addr[CONFIG_IPV4_ADDR_MAX];
-    char ipv6_addr[CONFIG_IPV6_ADDR_MAX];
-
-    network_get_addresses(ifname, ipv4_addr, sizeof(ipv4_addr),
-                          ipv6_addr, sizeof(ipv6_addr));
-
-    return (ipv4_addr[0] != '\0' || ipv6_addr[0] != '\0');
-}
-
-/*
- * Download TLE data from URL and save filtered results to file.
- * Returns number of satellites saved, or -1 on error.
- */
-static int download_tle_data(const char *url, const int *norad_ids, int norad_count,
-                             const char *output_path, int max_satellites)
-{
-    /* Open output file */
-    FILE *output = fopen(output_path, "w");
-    if (output == NULL) {
-        LOG_ERROR("TLE", "Failed to create temp file: %s", output_path);
-        return -1;
-    }
-
-    /* Initialize parser - static to reduce stack usage */
-    static tle_stream_parser_t parser;
-    tle_parser_init(&parser, norad_ids, norad_count, output, max_satellites);
-
-    /* Download and parse */
-    LOG_INFO("TLE", "Downloading TLE from: %s", url);
-
-    https_error_t err = https_get_stream(url, 60, tle_download_callback, &parser);
-
-    fclose(output);
-
-    if (err != HTTPS_SUCCESS) {
-        LOG_ERROR("TLE", "Download failed: %s", https_error_string(err));
-        unlink(output_path);
-        return -1;
-    }
-
-    LOG_INFO("TLE", "Download complete: parsed %d, matched %d satellites",
-             parser.total_parsed, parser.matches_found);
-
-    return parser.matches_found;
-}
-
-/*
- * TLE Updater Task
- *
- * Downloads TLE data from configured URL, filters by configured satellites,
- * saves to SD card, and loads into memory.
- * Notifies controller when database is updated.
- */
-rtems_task tle_updater_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("TLE", "Updater task started");
-
-    /* Get initial configuration - static to reduce stack usage */
-    static config_t cfg;
-    config_get_copy(&cfg);
-
-    /* Try to load existing TLE from file on startup */
-    rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-    int loaded = load_tle_database(TLE_FILE_PATH);
-    rtems_semaphore_release(g_tle_database_mutex);
-
-    if (loaded > 0) {
-        /* Notify controller that TLE database is ready */
-        tle_update_message_t msg;
-        msg.type = MSG_TLE_DATABASE_UPDATED;
-        rtems_message_queue_send(g_tle_queue, &msg, sizeof(msg));
-    }
-
-    /* Main update loop */
-    while (true) {
-        /* Refresh configuration */
-        config_get_copy(&cfg);
-
-        /* Check if networking is enabled */
-        if (!cfg.network.enabled) {
-            LOG_DEBUG("TLE", "Network disabled, skipping update");
-            rtems_task_wake_after(cfg.tle_update_interval_hours * 60 * 60 *
-                                  rtems_clock_get_ticks_per_second());
-            continue;
-        }
-
-        /* Wait for network to be available */
-        int retries = 0;
-        while (!network_is_available(cfg.network.interface) && retries < 12) {
-            LOG_DEBUG("TLE", "Waiting for network...");
-            rtems_task_wake_after(5 * rtems_clock_get_ticks_per_second());
-            retries++;
-        }
-
-        if (!network_is_available(cfg.network.interface)) {
-            LOG_WARN("TLE", "Network not available after 60s, will retry later");
-            rtems_task_wake_after(5 * 60 * rtems_clock_get_ticks_per_second());
-            continue;
-        }
-
-        /* Download TLE data to temp file */
-        int downloaded = download_tle_data(
-            cfg.tle_url,
-            cfg.satellite_count > 0 ? cfg.satellite_norad_ids : NULL,
-            cfg.satellite_count,
-            TLE_TEMP_FILE_PATH,
-            MAX_SATELLITES
-        );
-
-        if (downloaded > 0) {
-            /* Remove existing file first (required for FAT filesystems) */
-            unlink(TLE_FILE_PATH);
-
-            /* Rename temp file to final location */
-            if (rename(TLE_TEMP_FILE_PATH, TLE_FILE_PATH) != 0) {
-                LOG_ERROR("TLE", "Failed to rename temp file: %s", strerror(errno));
-                unlink(TLE_TEMP_FILE_PATH);
-            } else {
-                /* Load new TLE data into memory */
-                rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-                load_tle_database(TLE_FILE_PATH);
-                rtems_semaphore_release(g_tle_database_mutex);
-
-                /* Notify controller */
-                tle_update_message_t msg;
-                msg.type = MSG_TLE_DATABASE_UPDATED;
-                rtems_message_queue_send(g_tle_queue, &msg, sizeof(msg));
-            }
-        } else if (downloaded == 0) {
-            LOG_WARN("TLE", "No matching satellites found in download");
-            unlink(TLE_TEMP_FILE_PATH);
-        } else {
-            /* Download failed, keep existing data */
-            LOG_WARN("TLE", "Download failed, keeping existing TLE data");
-        }
-
-        /* Wait for next update interval */
-        rtems_task_wake_after(cfg.tle_update_interval_hours * 60 * 60 *
-                              rtems_clock_get_ticks_per_second());
-    }
-}
-
-/*
- * Helper function to convert radio mode enum to string.
- */
-static const char *radio_mode_to_string(radio_mode_t mode) {
-    switch (mode) {
-        case RADIO_MODE_LSB:      return "LSB";
-        case RADIO_MODE_USB:      return "USB";
-        case RADIO_MODE_CW:       return "CW";
-        case RADIO_MODE_FM:       return "FM";
-        case RADIO_MODE_AM:       return "AM";
-        case RADIO_MODE_RTTY_LSB: return "RTTY-L";
-        case RADIO_MODE_CW_R:     return "CW-R";
-        case RADIO_MODE_DATA_LSB: return "DATA-L";
-        case RADIO_MODE_RTTY_USB: return "RTTY-U";
-        case RADIO_MODE_DATA_FM:  return "DATA-FM";
-        case RADIO_MODE_FM_N:     return "FM-N";
-        case RADIO_MODE_DATA_USB: return "DATA-U";
-        case RADIO_MODE_AM_N:     return "AM-N";
-        case RADIO_MODE_C4FM:     return "C4FM";
-        default:                  return "???";
-    }
-}
-
-/*
- * Helper function to convert radio preamp enum to string.
- */
-static const char *radio_preamp_to_string(radio_preamp_t preamp) {
-    switch (preamp) {
-        case RADIO_PREAMP_IPO:  return "IPO";
-        case RADIO_PREAMP_AMP1: return "AMP1";
-        case RADIO_PREAMP_AMP2: return "AMP2";
-        default:                return "???";
-    }
-}
 
 /*
  * Status Task
@@ -2063,951 +789,20 @@ rtems_task status_task(rtems_task_argument arg) {
                         LOG_INFO("STATUS", "  IPv6: %s", ipv6_addr);
                     }
                 } else {
-                    LOG_INFO("STATUS", "Network: %s (no address)", net_cfg.network.interface);
+                    LOG_INFO("STATUS", "Network: no address");
                 }
             } else {
                 LOG_INFO("STATUS", "Network: disabled");
             }
         }
+
+        LOG_INFO("STATUS", "=====================");
     }
 }
 
 // ============================================================================
-// Pass Calculator Helper Functions
+// Controller Task
 // ============================================================================
-
-/* Time step for coarse pass scanning (seconds) */
-#define PASS_SCAN_STEP_SEC 60
-
-/* Buffer added to prediction window (minutes) */
-#define PASS_WINDOW_BUFFER_MIN 5
-
-/* Binary search precision (seconds) */
-#define PASS_REFINE_PRECISION_SEC 1.0
-
-/*
- * Calculate look angles at a specific time.
- * Returns true if calculation was successful.
- */
-static bool calculate_look_angles_at_time(
-    const sgp4_state_t *sat_state,
-    const sgp4_geodetic_t *observer,
-    double jd,
-    sgp4_look_angles_t *angles)
-{
-    /* Calculate minutes since TLE epoch */
-    double epoch_jd = sat_state->jdsatepoch + sat_state->jdsatepochF;
-    double tsince_min = (jd - epoch_jd) * 1440.0;  /* days to minutes */
-
-    /* Propagate satellite position */
-    sgp4_result_t result;
-    sgp4_error_t err = sgp4_propagate(sat_state, tsince_min, &result);
-    if (err != SGP4_SUCCESS) {
-        return false;
-    }
-
-    /* Convert ECI to ECEF */
-    double gst = sgp4_gstime(jd);
-    sgp4_vec3_t eci = { result.r[0], result.r[1], result.r[2] };
-    sgp4_vec3_t ecef;
-    sgp4_eci_to_ecef(&eci, gst, &ecef);
-
-    /* Calculate look angles */
-    sgp4_look_angles(&ecef, observer, angles);
-
-    return true;
-}
-
-/*
- * Refine a visibility transition (AOS or LOS) using binary search.
- *
- * @param sat_state      Satellite SGP4 state
- * @param observer       Observer location
- * @param t_before       Time when satellite was NOT visible
- * @param t_after        Time when satellite WAS visible (for AOS)
- * @param min_el_rad     Minimum elevation threshold
- * @param looking_for_aos True if looking for AOS, false for LOS
- * @return               Refined transition time as Julian Date
- */
-static double refine_transition(
-    const sgp4_state_t *sat_state,
-    const sgp4_geodetic_t *observer,
-    double t_before,
-    double t_after,
-    double min_el_rad,
-    bool looking_for_aos)
-{
-    double precision_jd = PASS_REFINE_PRECISION_SEC / 86400.0;
-
-    while ((t_after - t_before) > precision_jd) {
-        double t_mid = (t_before + t_after) / 2.0;
-
-        sgp4_look_angles_t angles;
-        if (!calculate_look_angles_at_time(sat_state, observer, t_mid, &angles)) {
-            break;  /* Propagation error - return best estimate */
-        }
-
-        bool is_visible = angles.elevation_rad >= min_el_rad;
-
-        if (looking_for_aos) {
-            if (is_visible) {
-                t_after = t_mid;
-            } else {
-                t_before = t_mid;
-            }
-        } else {  /* looking for LOS */
-            if (is_visible) {
-                t_before = t_mid;
-            } else {
-                t_after = t_mid;
-            }
-        }
-    }
-
-    return (t_before + t_after) / 2.0;
-}
-
-/*
- * Find maximum elevation during a pass using ternary search.
- *
- * @param sat_state  Satellite SGP4 state
- * @param observer   Observer location
- * @param aos_jd     Start of pass (AOS)
- * @param los_jd     End of pass (LOS)
- * @param max_el_out Output: maximum elevation in radians
- * @return           True if successful
- */
-static bool find_max_elevation(
-    const sgp4_state_t *sat_state,
-    const sgp4_geodetic_t *observer,
-    double aos_jd,
-    double los_jd,
-    double *max_el_out)
-{
-    double low = aos_jd;
-    double high = los_jd;
-    double precision_jd = 1.0 / 86400.0;  /* 1 second */
-
-    while ((high - low) > precision_jd) {
-        double mid1 = low + (high - low) / 3.0;
-        double mid2 = high - (high - low) / 3.0;
-
-        sgp4_look_angles_t angles1, angles2;
-        if (!calculate_look_angles_at_time(sat_state, observer, mid1, &angles1) ||
-            !calculate_look_angles_at_time(sat_state, observer, mid2, &angles2)) {
-            return false;
-        }
-
-        if (angles1.elevation_rad < angles2.elevation_rad) {
-            low = mid1;
-        } else {
-            high = mid2;
-        }
-    }
-
-    /* Get final elevation at peak */
-    sgp4_look_angles_t angles;
-    if (!calculate_look_angles_at_time(sat_state, observer, (low + high) / 2.0, &angles)) {
-        return false;
-    }
-
-    *max_el_out = angles.elevation_rad;
-    return true;
-}
-
-/*
- * Find the next satellite pass within the given time window.
- *
- * @param sat_state    Satellite SGP4 state
- * @param norad_id     Satellite NORAD ID
- * @param observer     Observer location
- * @param start_jd     Start of search window (Julian Date)
- * @param end_jd       End of search window (Julian Date)
- * @param min_el_rad   Minimum elevation for visibility
- * @param pass_out     Output: found pass information
- * @return             True if a pass was found
- */
-static bool find_next_pass(
-    const sgp4_state_t *sat_state,
-    int norad_id,
-    const sgp4_geodetic_t *observer,
-    double start_jd,
-    double end_jd,
-    double min_el_rad,
-    pass_info_t *pass_out)
-{
-    double step_jd = PASS_SCAN_STEP_SEC / 86400.0;
-
-    /* Check if satellite is currently visible (skip in-progress passes) */
-    sgp4_look_angles_t initial_angles;
-    if (calculate_look_angles_at_time(sat_state, observer, start_jd, &initial_angles)) {
-        if (initial_angles.elevation_rad >= min_el_rad) {
-            /* Satellite is already visible - skip to find next pass */
-            /* Scan forward to find when it sets */
-            double t = start_jd;
-            bool was_visible = true;
-            while (t < end_jd && was_visible) {
-                t += step_jd;
-                sgp4_look_angles_t angles;
-                if (calculate_look_angles_at_time(sat_state, observer, t, &angles)) {
-                    was_visible = angles.elevation_rad >= min_el_rad;
-                } else {
-                    break;
-                }
-            }
-            /* Now start searching from when it set */
-            start_jd = t;
-        }
-    }
-
-    /* Coarse scan for AOS */
-    bool prev_visible = false;
-    double aos_approx = 0.0;
-    double los_approx = 0.0;
-    bool found_aos = false;
-
-    for (double t = start_jd; t < end_jd; t += step_jd) {
-        sgp4_look_angles_t angles;
-        if (!calculate_look_angles_at_time(sat_state, observer, t, &angles)) {
-            continue;  /* Propagation failed - skip this time point */
-        }
-
-        bool curr_visible = angles.elevation_rad >= min_el_rad;
-
-        if (!prev_visible && curr_visible) {
-            /* Found approximate AOS */
-            aos_approx = t;
-            found_aos = true;
-        } else if (prev_visible && !curr_visible && found_aos) {
-            /* Found approximate LOS */
-            los_approx = t;
-
-            /* Refine AOS */
-            double aos_refined = refine_transition(
-                sat_state, observer,
-                aos_approx - step_jd, aos_approx,
-                min_el_rad, true);
-
-            /* Refine LOS */
-            double los_refined = refine_transition(
-                sat_state, observer,
-                los_approx - step_jd, los_approx,
-                min_el_rad, false);
-
-            /* Find max elevation */
-            double max_el;
-            if (!find_max_elevation(sat_state, observer, aos_refined, los_refined, &max_el)) {
-                max_el = 0.1;  /* Default if calculation fails */
-            }
-
-            /* Get AOS and LOS azimuths */
-            sgp4_look_angles_t aos_angles, los_angles;
-            calculate_look_angles_at_time(sat_state, observer, aos_refined, &aos_angles);
-            calculate_look_angles_at_time(sat_state, observer, los_refined, &los_angles);
-
-            /* Populate pass info */
-            pass_out->norad_id = norad_id;
-            pass_out->aos_jd = aos_refined;
-            pass_out->los_jd = los_refined;
-            pass_out->max_elevation_rad = max_el;
-            pass_out->aos_azimuth_rad = aos_angles.azimuth_rad;
-            pass_out->los_azimuth_rad = los_angles.azimuth_rad;
-
-            return true;
-        }
-
-        prev_visible = curr_visible;
-    }
-
-    /* Check if pass extends beyond window */
-    if (found_aos && prev_visible) {
-        /* Pass started but didn't end within window - refine AOS and use window end */
-        double aos_refined = refine_transition(
-            sat_state, observer,
-            aos_approx - step_jd, aos_approx,
-            min_el_rad, true);
-
-        double max_el;
-        if (!find_max_elevation(sat_state, observer, aos_refined, end_jd, &max_el)) {
-            max_el = 0.1;
-        }
-
-        sgp4_look_angles_t aos_angles, los_angles;
-        calculate_look_angles_at_time(sat_state, observer, aos_refined, &aos_angles);
-        calculate_look_angles_at_time(sat_state, observer, end_jd, &los_angles);
-
-        pass_out->norad_id = norad_id;
-        pass_out->aos_jd = aos_refined;
-        pass_out->los_jd = end_jd;  /* Truncated to window */
-        pass_out->max_elevation_rad = max_el;
-        pass_out->aos_azimuth_rad = aos_angles.azimuth_rad;
-        pass_out->los_azimuth_rad = los_angles.azimuth_rad;
-
-        return true;
-    }
-
-    return false;
-}
-
-/*
- * Pass Calculator Task
- *
- * Periodically calculates upcoming satellite passes.
- * Uses the TLE database and observer location.
- * Sends pass predictions to controller.
- */
-rtems_task pass_calculator_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("PASS", "Calculator task started");
-
-    /* Wait for initial GPS fix and TLE load */
-    rtems_task_wake_after(10 * rtems_clock_get_ticks_per_second());
-
-    while (true) {
-        /* Get configuration */
-        config_t cfg;
-        config_get_copy(&cfg);
-
-        int prediction_window_min = cfg.pass.prediction_window_min;
-        double min_el_rad = cfg.pass.min_elevation_deg * SGP4_DEG_TO_RAD;
-        int calc_interval_sec = cfg.pass.calc_interval_sec;
-
-        /* Get current state snapshot */
-        rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-        bool location_valid = g_state.location_valid;
-        bool time_valid = g_state.time_valid;
-        sgp4_geodetic_t observer = g_state.observer_location;
-        time_t current_time = g_state.current_time;
-        rtems_semaphore_release(g_state_mutex);
-
-        if (!location_valid || !time_valid) {
-            LOG_DEBUG("PASS", "Waiting for GPS fix...");
-            rtems_task_wake_after(10 * rtems_clock_get_ticks_per_second());
-            continue;
-        }
-
-        /* Calculate time window */
-        double start_jd = sgp4_unix_to_jd((double)current_time);
-        double end_jd = start_jd + (prediction_window_min + PASS_WINDOW_BUFFER_MIN) / 1440.0;
-
-        int passes_found = 0;
-
-        /* Iterate over all satellites */
-        rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-        int sat_count = g_state.satellite_count;
-
-        for (int i = 0; i < sat_count && i < MAX_SATELLITES; i++) {
-            if (!g_state.satellites[i].valid) {
-                continue;
-            }
-
-            pass_info_t pass;
-            if (find_next_pass(&g_state.satellites[i].state,
-                               g_state.satellites[i].tle.norad_id,
-                               &observer,
-                               start_jd, end_jd,
-                               min_el_rad,
-                               &pass)) {
-
-                /* Send pass to controller */
-                pass_message_t msg;
-                msg.type = MSG_PASS_CALCULATED;
-                msg.pass = pass;
-
-                rtems_status_code status = rtems_message_queue_send(
-                    g_pass_queue, &msg, sizeof(msg));
-
-                if (status == RTEMS_SUCCESSFUL) {
-                    passes_found++;
-                    LOG_DEBUG("PASS", "Found pass: NORAD %d, max_el=%.1f deg",
-                              pass.norad_id,
-                              pass.max_elevation_rad * SGP4_RAD_TO_DEG);
-                } else if (status == RTEMS_TOO_MANY) {
-                    LOG_WARN("PASS", "Pass queue full, dropping pass for NORAD %d",
-                             pass.norad_id);
-                }
-            }
-        }
-
-        rtems_semaphore_release(g_tle_database_mutex);
-
-        if (passes_found > 0) {
-            LOG_INFO("PASS", "Found %d passes in next %d minutes",
-                     passes_found, prediction_window_min);
-        }
-
-        /* Sleep until next calculation cycle */
-        rtems_task_wake_after(calc_interval_sec * rtems_clock_get_ticks_per_second());
-    }
-}
-
-// ============================================================================
-// Pass Executor Helper Functions
-// ============================================================================
-
-/* Speed of light in km/s */
-#define C_KM_S 299792.458
-
-/* Earth rotation rate in rad/s */
-#define OMEGA_EARTH 7.292115e-5
-
-/*
- * Look up satellite in TLE database and copy its SGP4 state.
- * Returns true if found, false otherwise.
- * Caller must hold g_tle_database_mutex.
- */
-static bool get_satellite_state(int norad_id, sgp4_state_t *state_out,
-                                 char *name_out, size_t name_size)
-{
-    for (int i = 0; i < g_state.satellite_count && i < MAX_SATELLITES; i++) {
-        if (g_state.satellites[i].valid &&
-            g_state.satellites[i].tle.norad_id == norad_id) {
-            *state_out = g_state.satellites[i].state;
-            if (name_out && name_size > 0) {
-                strncpy(name_out, g_state.satellites[i].tle.name, name_size - 1);
-                name_out[name_size - 1] = '\0';
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * Calculate Doppler shift factor from satellite velocity.
- *
- * The Doppler shift for radio frequencies is:
- *   f_received = f_transmitted * (1 - v_radial / c)
- *
- * Where v_radial is the radial velocity (positive = moving away).
- *
- * Returns the factor to multiply the nominal frequency by.
- * For approaching satellite: factor > 1 (frequency shifts up)
- * For receding satellite: factor < 1 (frequency shifts down)
- *
- * @param sat_ecef        Satellite position in ECEF (km)
- * @param sat_vel_ecef    Satellite velocity in ECEF (km/s)
- * @param obs_ecef        Observer position in ECEF (km)
- * @param range_rate_out  Output: range rate in km/s (positive = moving away)
- * @return                Doppler factor (multiply nominal freq by this)
- */
-static double calculate_doppler_factor(
-    const sgp4_vec3_t *sat_ecef,
-    const sgp4_vec3_t *sat_vel_ecef,
-    const sgp4_vec3_t *obs_ecef,
-    double *range_rate_out)
-{
-    /* Calculate range vector (observer to satellite) */
-    sgp4_vec3_t range_vec;
-    range_vec.x = sat_ecef->x - obs_ecef->x;
-    range_vec.y = sat_ecef->y - obs_ecef->y;
-    range_vec.z = sat_ecef->z - obs_ecef->z;
-
-    /* Normalize range vector to get unit vector */
-    double range_mag = sgp4_vec3_magnitude(&range_vec);
-    if (range_mag < 0.001) {
-        /* Degenerate case - satellite at observer */
-        if (range_rate_out) *range_rate_out = 0.0;
-        return 1.0;
-    }
-
-    sgp4_vec3_t range_unit;
-    range_unit.x = range_vec.x / range_mag;
-    range_unit.y = range_vec.y / range_mag;
-    range_unit.z = range_vec.z / range_mag;
-
-    /* Range rate = dot product of velocity and unit range vector */
-    /* Positive means moving away, negative means approaching */
-    double range_rate = sgp4_vec3_dot(sat_vel_ecef, &range_unit);
-
-    if (range_rate_out) *range_rate_out = range_rate;
-
-    /* Doppler factor: approaching (negative range_rate) increases frequency */
-    return 1.0 - (range_rate / C_KM_S);
-}
-
-/*
- * Calculate satellite position, look angles, and Doppler factor at a given time.
- * Returns true on success.
- */
-static bool calculate_tracking_data(
-    const sgp4_state_t *sat_state,
-    const sgp4_geodetic_t *observer,
-    double jd,
-    sgp4_look_angles_t *angles_out,
-    double *doppler_factor_out,
-    double *range_rate_out)
-{
-    /* Calculate minutes since TLE epoch */
-    double epoch_jd = sat_state->jdsatepoch + sat_state->jdsatepochF;
-    double tsince_min = (jd - epoch_jd) * 1440.0;
-
-    /* Propagate satellite position and velocity */
-    sgp4_result_t result;
-    sgp4_error_t err = sgp4_propagate(sat_state, tsince_min, &result);
-    if (err != SGP4_SUCCESS) {
-        return false;
-    }
-
-    /* Get Greenwich Sidereal Time */
-    double gst = sgp4_gstime(jd);
-
-    /* Convert satellite position ECI to ECEF */
-    sgp4_vec3_t sat_eci = { result.r[0], result.r[1], result.r[2] };
-    sgp4_vec3_t sat_ecef;
-    sgp4_eci_to_ecef(&sat_eci, gst, &sat_ecef);
-
-    /* Calculate look angles */
-    sgp4_look_angles(&sat_ecef, observer, angles_out);
-
-    /* Convert satellite velocity ECI to ECEF */
-    /* v_ecef = R * v_eci - omega x r_ecef */
-    sgp4_vec3_t vel_eci = { result.v[0], result.v[1], result.v[2] };
-    sgp4_vec3_t vel_ecef;
-
-    double cos_gst = cos(gst);
-    double sin_gst = sin(gst);
-
-    vel_ecef.x = cos_gst * vel_eci.x + sin_gst * vel_eci.y + OMEGA_EARTH * sat_ecef.y;
-    vel_ecef.y = -sin_gst * vel_eci.x + cos_gst * vel_eci.y - OMEGA_EARTH * sat_ecef.x;
-    vel_ecef.z = vel_eci.z;
-
-    /* Convert observer to ECEF */
-    sgp4_vec3_t obs_ecef;
-    sgp4_geodetic_to_ecef(observer, &obs_ecef);
-
-    /* Calculate Doppler factor */
-    *doppler_factor_out = calculate_doppler_factor(&sat_ecef, &vel_ecef, &obs_ecef,
-                                                    range_rate_out);
-
-    return true;
-}
-
-// ============================================================================
-// Pass Executor State Machine Handlers
-// ============================================================================
-
-/* Forward declarations */
-static void handle_start_pass(const pass_info_t *pass);
-static void handle_abort_pass(void);
-static void process_prepositioning(double current_jd, const sgp4_geodetic_t *observer);
-static void process_waiting_aos(double current_jd);
-static void process_tracking(double current_jd, const sgp4_geodetic_t *observer,
-                             double rot_threshold_rad, double doppler_threshold_khz);
-static void process_completing(void);
-
-/*
- * Handle START_PASS command.
- */
-static void handle_start_pass(const pass_info_t *pass) {
-    /* Log pass details */
-    double aos_unix = sgp4_jd_to_unix(pass->aos_jd);
-    struct tm *aos_tm = gmtime((time_t *)&aos_unix);
-
-    LOG_INFO("EXEC", "Starting pass for NORAD %d", pass->norad_id);
-    LOG_INFO("EXEC", "  AOS: %02d:%02d:%02d, az=%.1f deg",
-             aos_tm->tm_hour, aos_tm->tm_min, aos_tm->tm_sec,
-             pass->aos_azimuth_rad * SGP4_RAD_TO_DEG);
-    LOG_INFO("EXEC", "  Max elevation: %.1f deg",
-             pass->max_elevation_rad * SGP4_RAD_TO_DEG);
-
-    /* Copy satellite state from TLE database */
-    rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-    bool found = get_satellite_state(pass->norad_id,
-                                      &g_executor_state.sat_state,
-                                      g_executor_state.sat_name,
-                                      sizeof(g_executor_state.sat_name));
-    rtems_semaphore_release(g_tle_database_mutex);
-
-    if (!found) {
-        LOG_ERROR("EXEC", "Satellite NORAD %d not found in TLE database",
-                  pass->norad_id);
-        return;
-    }
-
-    /* Initialize tracking state */
-    g_executor_state.current_pass = *pass;
-    g_executor_state.sat_state_valid = true;
-    g_executor_state.rotator_commanded = false;
-    g_executor_state.doppler_valid = false;
-    g_executor_state.last_doppler_factor = 1.0;
-
-    /* Send preposition command */
-    rotator_command_message_t rot_cmd;
-    rot_cmd.command = ROT_CMD_GOTO;
-    rot_cmd.target_azimuth_rad = pass->aos_azimuth_rad;
-    rot_cmd.target_elevation_rad = 0.0;  /* Start at horizon */
-
-    rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
-
-    g_executor_state.last_cmd_azimuth_rad = pass->aos_azimuth_rad;
-    g_executor_state.last_cmd_elevation_rad = 0.0;
-    g_executor_state.rotator_commanded = true;
-
-    LOG_INFO("EXEC", "Prepositioning antenna to az=%.1f el=0.0",
-             pass->aos_azimuth_rad * SGP4_RAD_TO_DEG);
-
-    g_executor_state.state = EXEC_STATE_PREPOSITIONING;
-}
-
-/*
- * Handle ABORT_PASS command.
- */
-static void handle_abort_pass(void) {
-    LOG_WARN("EXEC", "Aborting pass for NORAD %d",
-             g_executor_state.current_pass.norad_id);
-
-    /* Send stop command to rotator */
-    rotator_command_message_t rot_cmd;
-    rot_cmd.command = ROT_CMD_STOP;
-    rot_cmd.target_azimuth_rad = 0.0;
-    rot_cmd.target_elevation_rad = 0.0;
-    rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
-
-    /* Reset state */
-    g_executor_state.state = EXEC_STATE_IDLE;
-    g_executor_state.sat_state_valid = false;
-    g_executor_state.rotator_commanded = false;
-    g_executor_state.doppler_valid = false;
-}
-
-/*
- * Process PREPOSITIONING state.
- * Transition to WAITING_AOS when close to AOS time.
- */
-static void process_prepositioning(double current_jd,
-                                    const sgp4_geodetic_t *observer) {
-    (void)observer;
-    config_t cfg;
-    config_get_copy(&cfg);
-    double prepos_margin_jd = cfg.pass.preposition_margin_sec / 86400.0;
-
-    double time_to_aos = g_executor_state.current_pass.aos_jd - current_jd;
-
-    if (time_to_aos <= prepos_margin_jd) {
-        LOG_INFO("EXEC", "Preposition complete, waiting for AOS (%.0f sec)",
-                 time_to_aos * 86400.0);
-        g_executor_state.state = EXEC_STATE_WAITING_AOS;
-    }
-}
-
-/*
- * Process WAITING_AOS state.
- * Transition to TRACKING when satellite rises above horizon.
- */
-static void process_waiting_aos(double current_jd) {
-    if (current_jd >= g_executor_state.current_pass.aos_jd) {
-        LOG_INFO("EXEC", "AOS - Beginning tracking of %s",
-                 g_executor_state.sat_name);
-        g_executor_state.state = EXEC_STATE_TRACKING;
-    }
-}
-
-/*
- * Process TRACKING state.
- * Update rotator and radio as needed.
- */
-static void process_tracking(double current_jd, const sgp4_geodetic_t *observer,
-                             double rot_threshold_rad, double doppler_threshold_khz) {
-    /* Check if pass has ended */
-    if (current_jd >= g_executor_state.current_pass.los_jd) {
-        LOG_INFO("EXEC", "LOS - Pass complete for %s",
-                 g_executor_state.sat_name);
-        g_executor_state.state = EXEC_STATE_COMPLETING;
-        return;
-    }
-
-    /* Calculate current satellite position and doppler */
-    sgp4_look_angles_t angles;
-    double doppler_factor;
-    double range_rate;
-
-    if (!calculate_tracking_data(&g_executor_state.sat_state, observer, current_jd,
-                                  &angles, &doppler_factor, &range_rate)) {
-        LOG_WARN("EXEC", "SGP4 propagation failed");
-        return;
-    }
-
-    /* Update tracking state */
-    g_executor_state.current_azimuth_rad = angles.azimuth_rad;
-    g_executor_state.current_elevation_rad = angles.elevation_rad;
-    g_executor_state.current_range_km = angles.range_km;
-    g_executor_state.range_rate_km_s = range_rate;
-
-    /* Check if rotator needs update */
-    double az_diff = fabs(angles.azimuth_rad - g_executor_state.last_cmd_azimuth_rad);
-    double el_diff = fabs(angles.elevation_rad - g_executor_state.last_cmd_elevation_rad);
-
-    /* Handle azimuth wraparound */
-    if (az_diff > SGP4_PI) {
-        az_diff = SGP4_TWO_PI - az_diff;
-    }
-
-    if (az_diff >= rot_threshold_rad || el_diff >= rot_threshold_rad) {
-        rotator_command_message_t rot_cmd;
-        rot_cmd.command = ROT_CMD_GOTO;
-        rot_cmd.target_azimuth_rad = angles.azimuth_rad;
-        rot_cmd.target_elevation_rad = angles.elevation_rad;
-
-        rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
-
-        g_executor_state.last_cmd_azimuth_rad = angles.azimuth_rad;
-        g_executor_state.last_cmd_elevation_rad = angles.elevation_rad;
-
-        LOG_DEBUG("EXEC", "Rotator: az=%.1f el=%.1f deg",
-                  angles.azimuth_rad * SGP4_RAD_TO_DEG,
-                  angles.elevation_rad * SGP4_RAD_TO_DEG);
-    }
-
-    /* Check if doppler correction needs update */
-    /* Use 145.9 MHz as reference for threshold calculation */
-    double doppler_diff_hz = fabs(doppler_factor - g_executor_state.last_doppler_factor) *
-                             145.9e6;
-
-    if (!g_executor_state.doppler_valid ||
-        doppler_diff_hz >= (doppler_threshold_khz * 1000.0)) {
-        g_executor_state.last_doppler_factor = doppler_factor;
-        g_executor_state.doppler_valid = true;
-
-        /* Log doppler info (actual frequency commands stubbed out for now) */
-        double shift_hz = (doppler_factor - 1.0) * 145.9e6;
-        LOG_DEBUG("EXEC", "Doppler: factor=%.9f, shift=%.0f Hz at 145.9 MHz",
-                  doppler_factor, shift_hz);
-
-        /* TODO: Send radio frequency command */
-        /* radio_set_doppler_offset(doppler_factor); */
-    }
-}
-
-/*
- * Process COMPLETING state.
- * Clean up and return to IDLE.
- */
-static void process_completing(void) {
-    /* Park the rotator */
-    rotator_command_message_t rot_cmd;
-    rot_cmd.command = ROT_CMD_PARK;
-    rot_cmd.target_azimuth_rad = 0.0;
-    rot_cmd.target_elevation_rad = 0.0;
-    rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
-
-    LOG_INFO("EXEC", "Pass completed, returning to idle");
-
-    g_executor_state.state = EXEC_STATE_IDLE;
-    g_executor_state.sat_state_valid = false;
-    g_executor_state.rotator_commanded = false;
-    g_executor_state.doppler_valid = false;
-}
-
-// ============================================================================
-// Pass Executor Task
-// ============================================================================
-
-/*
- * Pass Executor Task
- *
- * Executes satellite passes by controlling the rotator and radio.
- * Receives commands from the controller via g_executor_cmd_queue.
- * Maintains real-time tracking state and sends commands via g_rotator_cmd_queue.
- */
-rtems_task pass_executor_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("EXEC", "Pass executor task started");
-
-    /* Initialize state */
-    memset(&g_executor_state, 0, sizeof(g_executor_state));
-    g_executor_state.state = EXEC_STATE_IDLE;
-
-    while (true) {
-        /* Get configuration */
-        config_t cfg;
-        config_get_copy(&cfg);
-
-        int poll_ms = cfg.pass.tracking_poll_ms;
-        double rot_threshold_rad = cfg.pass.rotator_threshold_deg * SGP4_DEG_TO_RAD;
-        double doppler_threshold_khz = cfg.pass.doppler_threshold_khz;
-
-        /* Calculate tick count for poll interval */
-        rtems_interval poll_ticks = (poll_ms * rtems_clock_get_ticks_per_second()) / 1000;
-        if (poll_ticks < 1) poll_ticks = 1;
-
-        /* Check for commands from controller */
-        executor_command_message_t cmd;
-        size_t size;
-        rtems_status_code status;
-
-        if (g_executor_state.state == EXEC_STATE_IDLE) {
-            /* Blocking wait when idle */
-            status = rtems_message_queue_receive(
-                g_executor_cmd_queue, &cmd, &size,
-                RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-        } else {
-            /* Non-blocking check during tracking */
-            status = rtems_message_queue_receive(
-                g_executor_cmd_queue, &cmd, &size,
-                RTEMS_NO_WAIT, 0);
-        }
-
-        /* Process command if received */
-        if (status == RTEMS_SUCCESSFUL) {
-            switch (cmd.command) {
-                case EXEC_CMD_START_PASS:
-                    handle_start_pass(&cmd.pass);
-                    break;
-
-                case EXEC_CMD_ABORT_PASS:
-                    handle_abort_pass();
-                    break;
-
-                default:
-                    LOG_WARN("EXEC", "Unknown command type: %d", cmd.command);
-                    break;
-            }
-        }
-
-        /* State machine processing */
-        if (g_executor_state.state != EXEC_STATE_IDLE) {
-            /* Get current time */
-            rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-            time_t current_time = g_state.current_time;
-            bool time_valid = g_state.time_valid;
-            sgp4_geodetic_t observer = g_state.observer_location;
-            bool location_valid = g_state.location_valid;
-            rtems_semaphore_release(g_state_mutex);
-
-            if (!time_valid || !location_valid) {
-                LOG_WARN("EXEC", "GPS not available during tracking");
-                rtems_task_wake_after(poll_ticks);
-                continue;
-            }
-
-            double current_jd = sgp4_unix_to_jd((double)current_time);
-
-            switch (g_executor_state.state) {
-                case EXEC_STATE_PREPOSITIONING:
-                    process_prepositioning(current_jd, &observer);
-                    break;
-
-                case EXEC_STATE_WAITING_AOS:
-                    process_waiting_aos(current_jd);
-                    break;
-
-                case EXEC_STATE_TRACKING:
-                    process_tracking(current_jd, &observer, rot_threshold_rad,
-                                     doppler_threshold_khz);
-                    break;
-
-                case EXEC_STATE_COMPLETING:
-                    process_completing();
-                    break;
-
-                default:
-                    break;
-            }
-
-            /* Sleep for poll interval */
-            rtems_task_wake_after(poll_ticks);
-        }
-    }
-}
-
-// ============================================================================
-// Rotator Command Task
-// ============================================================================
-
-/*
- * Rotator Command Task
- *
- * Receives rotator commands from the pass executor and sends
- * GS-232A protocol commands to the rotator via UART.
- */
-rtems_task rotator_command_task(rtems_task_argument arg) {
-    (void)arg;
-    LOG_INFO("ROTCMD", "Rotator command task started");
-
-    /* Command buffer for GS-232A protocol */
-    char cmd_buf[32];
-
-    while (true) {
-        /* Wait for command */
-        rotator_command_message_t cmd;
-        size_t size;
-
-        rtems_status_code status = rtems_message_queue_receive(
-            g_rotator_cmd_queue, &cmd, &size,
-            RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-
-        if (status != RTEMS_SUCCESSFUL) {
-            LOG_ERROR("ROTCMD", "Failed to receive command: %d", status);
-            rtems_task_wake_after(rtems_clock_get_ticks_per_second());
-            continue;
-        }
-
-        /* Check if rotator is available */
-        if (g_rotator_fd < 0) {
-            LOG_WARN("ROTCMD", "Rotator not connected");
-            continue;
-        }
-
-        /* Process command */
-        switch (cmd.command) {
-            case ROT_CMD_GOTO: {
-                /* Convert radians to integer degrees for GS-232A */
-                int az_deg = (int)(cmd.target_azimuth_rad * SGP4_RAD_TO_DEG + 0.5);
-                int el_deg = (int)(cmd.target_elevation_rad * SGP4_RAD_TO_DEG + 0.5);
-
-                /* Clamp values to valid ranges */
-                if (az_deg < 0) az_deg += 360;
-                if (az_deg >= 360) az_deg -= 360;
-                if (el_deg < 0) el_deg = 0;
-                if (el_deg > 90) el_deg = 90;
-
-                /* Format GS-232A command: W<az> <el>\r */
-                /* W command moves to absolute position */
-                int len = snprintf(cmd_buf, sizeof(cmd_buf), "W%03d %03d\r",
-                                   az_deg, el_deg);
-
-                /* Send to rotator */
-                rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-                write(g_rotator_fd, cmd_buf, len);
-                fsync(g_rotator_fd);
-                rtems_semaphore_release(g_uart1_mutex);
-
-                LOG_DEBUG("ROTCMD", "Sent: W%03d %03d", az_deg, el_deg);
-                break;
-            }
-
-            case ROT_CMD_STOP: {
-                /* GS-232A stop command: S\r */
-                rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-                write(g_rotator_fd, "S\r", 2);
-                fsync(g_rotator_fd);
-                rtems_semaphore_release(g_uart1_mutex);
-
-                LOG_DEBUG("ROTCMD", "Sent: S (stop)");
-                break;
-            }
-
-            case ROT_CMD_PARK: {
-                /* Park at az=0, el=0 */
-                rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-                write(g_rotator_fd, "W000 000\r", 9);
-                fsync(g_rotator_fd);
-                rtems_semaphore_release(g_uart1_mutex);
-
-                LOG_DEBUG("ROTCMD", "Sent: W000 000 (park)");
-                break;
-            }
-
-            default:
-                LOG_WARN("ROTCMD", "Unknown command: %d", cmd.command);
-                break;
-        }
-
-        /* Small delay between commands to avoid flooding rotator */
-        rtems_task_wake_after(rtems_clock_get_ticks_per_second() / 20);  /* 50ms */
-    }
-}
 
 /*
  * Controller Task
@@ -3030,7 +825,7 @@ rtems_task controller_task(rtems_task_argument arg) {
             size_t gps_size;
             while (rtems_message_queue_receive(g_gps_queue, &gps_msg, &gps_size,
                                                RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
-       
+
                 // Update shared state
                 rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
 
@@ -3075,10 +870,10 @@ rtems_task controller_task(rtems_task_argument arg) {
             antenna_position_message_t ant_msg;
             size_t ant_size;
             while (rtems_message_queue_receive(g_antenna_queue, &ant_msg, &ant_size,
-                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {                
+                                               RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
                 // Update shared state
                 rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-                if (!g_state.antenna_position_valid || 
+                if (!g_state.antenna_position_valid ||
                     !(g_state.antenna_azimuth == ant_msg.azimuth) ||
                     !(g_state.antenna_elevation == ant_msg.elevation)) {
                                 LOG_INFO("CTRL", "Antenna: az=%.1f el=%.1f deg",
@@ -3754,6 +1549,9 @@ rtems_task Init(rtems_task_argument ignored) {
     g_state.antenna_position_valid = false;
     g_state.satellite_count = 0;
     g_state.radio_status_valid = false;
+
+    // Initialize executor state
+    memset(&g_executor_state, 0, sizeof(g_executor_state));
 
     // Initialize logging
     status = log_init();

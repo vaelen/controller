@@ -4,7 +4,7 @@
  * Configures pin muxing, clocks, and registers UART0 (console), UART1 (GPS),
  * UART2 (rotator), and UART4 (radio) with the RTEMS console driver.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 

@@ -1,7 +1,7 @@
 /*
  * SGP4/SDP4 Satellite Propagation Library
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  *
  * Based on the Vallado reference implementation from CelesTrak.
@@ -367,6 +367,74 @@ void sgp4_look_angles(const sgp4_vec3_t* sat_ecef, const sgp4_geodetic_t* observ
 static inline int sgp4_is_visible(const sgp4_look_angles_t* angles, double min_elevation_rad) {
     return angles->elevation_rad >= min_elevation_rad;
 }
+
+// ============================================================================
+// Doppler Calculations
+// ============================================================================
+
+// Physical constants for Doppler calculations
+#define SGP4_OMEGA_EARTH    7.292115e-5     // Earth rotation rate (rad/s)
+#define SGP4_C_KM_S         299792.458      // Speed of light (km/s)
+
+/*
+ * Transform ECI velocity to ECEF velocity.
+ *
+ * Applies the rotation matrix and Earth rotation correction:
+ *   v_ecef = R * v_eci - omega x r_ecef
+ *
+ * @param vel_eci      Velocity in ECI frame (km/s)
+ * @param sat_ecef     Satellite position in ECEF (km), needed for rotation correction
+ * @param gst          Greenwich Sidereal Time (radians)
+ * @param vel_ecef_out Output: velocity in ECEF frame (km/s)
+ */
+void sgp4_eci_velocity_to_ecef(const sgp4_vec3_t *vel_eci,
+                               const sgp4_vec3_t *sat_ecef,
+                               double gst,
+                               sgp4_vec3_t *vel_ecef_out);
+
+/*
+ * Calculate Doppler shift factor from satellite velocity.
+ *
+ * The Doppler shift for radio frequencies is:
+ *   f_received = f_transmitted * (1 - v_radial / c)
+ *
+ * Where v_radial is the radial velocity (positive = moving away).
+ *
+ * Returns the factor to multiply the nominal frequency by.
+ * For approaching satellite: factor > 1 (frequency shifts up)
+ * For receding satellite: factor < 1 (frequency shifts down)
+ *
+ * @param sat_ecef        Satellite position in ECEF (km)
+ * @param sat_vel_ecef    Satellite velocity in ECEF (km/s)
+ * @param obs_ecef        Observer position in ECEF (km)
+ * @param range_rate_out  Output: range rate in km/s (positive = moving away), can be NULL
+ * @return                Doppler factor (multiply nominal freq by this)
+ */
+double sgp4_calculate_doppler_factor(const sgp4_vec3_t *sat_ecef,
+                                     const sgp4_vec3_t *sat_vel_ecef,
+                                     const sgp4_vec3_t *obs_ecef,
+                                     double *range_rate_out);
+
+/*
+ * Calculate satellite position, look angles, and Doppler factor at a given time.
+ *
+ * This is a convenience function that combines SGP4 propagation, coordinate
+ * transforms, and Doppler calculation into a single call.
+ *
+ * @param sat_state         Initialized SGP4 state for the satellite
+ * @param observer          Observer geodetic position
+ * @param jd                Julian Date for calculation
+ * @param angles_out        Output: look angles (azimuth, elevation, range)
+ * @param doppler_factor_out Output: Doppler factor
+ * @param range_rate_out    Output: range rate in km/s (positive = moving away), can be NULL
+ * @return                  SGP4_SUCCESS or error code
+ */
+sgp4_error_t sgp4_calculate_tracking_data(const sgp4_state_t *sat_state,
+                                          const sgp4_geodetic_t *observer,
+                                          double jd,
+                                          sgp4_look_angles_t *angles_out,
+                                          double *doppler_factor_out,
+                                          double *range_rate_out);
 
 #ifdef __cplusplus
 }

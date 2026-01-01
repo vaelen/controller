@@ -4,7 +4,7 @@
  * Parses INI-style configuration files with minimal memory allocation.
  * Uses fixed-size buffers and follows existing codebase patterns.
  *
- * Copyright (c) 2025 Andrew C. Young <andrew@vaelen.org>
+ * Copyright (c) 2026 Andrew C. Young <andrew@vaelen.org>
  * SPDX-License-Identifier: MIT
  */
 
