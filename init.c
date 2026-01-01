@@ -17,7 +17,7 @@ rtems_task Init(rtems_task_argument argument);
 /* Console driver */
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 
-/* Task configuration: Init (1) + GPS + Antenna + RotatorStatus + RadioFreq + RadioStatus + TLE + Pass + PassExec + Controller + Status (10) + libbsd tasks */
+/* Task configuration: Init (1) + GPS + Antenna + RotatorStatus + RadioFreq + RadioStatus + TLE + Pass + PassExec + RotatorCmd + Controller + Status (11) + libbsd tasks */
 #define CONFIGURE_MAXIMUM_TASKS 32
 #define CONFIGURE_UNIFIED_WORK_AREAS
 #define CONFIGURE_UNLIMITED_OBJECTS

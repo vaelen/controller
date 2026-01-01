@@ -115,6 +115,12 @@ typedef struct pass_config {
     int prep_time_sec;             /* Time before AOS to start prep (default: 300) */
     int calc_interval_sec;         /* How often to recalculate (default: 300) */
     int status_display_count;      /* Number of passes to show in status (default: 5) */
+
+    /* Pass executor / tracking configuration */
+    int tracking_poll_ms;          /* Position update interval in ms (default: 100) */
+    double rotator_threshold_deg;  /* Min change to command rotator (default: 1.0) */
+    double doppler_threshold_khz;  /* Min change to update radio freq (default: 1.0) */
+    int preposition_margin_sec;    /* Time before AOS to finish preposition (default: 30) */
 } pass_config_t;
 
 /*

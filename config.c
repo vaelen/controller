@@ -405,6 +405,34 @@ static void process_pass_key(config_t *cfg, const char *key, const char *value)
         } else if (cfg->pass.status_display_count > 20) {
             cfg->pass.status_display_count = 20;
         }
+    } else if (strcasecmp_local(key, "tracking_poll_ms") == 0) {
+        cfg->pass.tracking_poll_ms = atoi(value);
+        if (cfg->pass.tracking_poll_ms < 10) {
+            cfg->pass.tracking_poll_ms = 10;
+        } else if (cfg->pass.tracking_poll_ms > 1000) {
+            cfg->pass.tracking_poll_ms = 1000;
+        }
+    } else if (strcasecmp_local(key, "rotator_threshold") == 0) {
+        cfg->pass.rotator_threshold_deg = atof(value);
+        if (cfg->pass.rotator_threshold_deg < 0.1) {
+            cfg->pass.rotator_threshold_deg = 0.1;
+        } else if (cfg->pass.rotator_threshold_deg > 10.0) {
+            cfg->pass.rotator_threshold_deg = 10.0;
+        }
+    } else if (strcasecmp_local(key, "doppler_threshold") == 0) {
+        cfg->pass.doppler_threshold_khz = atof(value);
+        if (cfg->pass.doppler_threshold_khz < 0.1) {
+            cfg->pass.doppler_threshold_khz = 0.1;
+        } else if (cfg->pass.doppler_threshold_khz > 10.0) {
+            cfg->pass.doppler_threshold_khz = 10.0;
+        }
+    } else if (strcasecmp_local(key, "preposition_margin") == 0) {
+        cfg->pass.preposition_margin_sec = atoi(value);
+        if (cfg->pass.preposition_margin_sec < 5) {
+            cfg->pass.preposition_margin_sec = 5;
+        } else if (cfg->pass.preposition_margin_sec > 120) {
+            cfg->pass.preposition_margin_sec = 120;
+        }
     }
 }
 
@@ -461,6 +489,12 @@ void config_init_defaults(config_t *cfg)
     cfg->pass.prep_time_sec = 300;
     cfg->pass.calc_interval_sec = 300;
     cfg->pass.status_display_count = 5;
+
+    /* Pass executor / tracking defaults */
+    cfg->pass.tracking_poll_ms = 100;
+    cfg->pass.rotator_threshold_deg = 1.0;
+    cfg->pass.doppler_threshold_khz = 1.0;
+    cfg->pass.preposition_margin_sec = 30;
 
     /* System settings */
     cfg->log_level = LOG_LEVEL_INFO;
@@ -664,6 +698,10 @@ config_error_t config_save(const config_t *cfg, const char *path)
     fprintf(f, "prep_time = %d\n", cfg->pass.prep_time_sec);
     fprintf(f, "calc_interval = %d\n", cfg->pass.calc_interval_sec);
     fprintf(f, "status_display_count = %d\n", cfg->pass.status_display_count);
+    fprintf(f, "tracking_poll_ms = %d\n", cfg->pass.tracking_poll_ms);
+    fprintf(f, "rotator_threshold = %.1f\n", cfg->pass.rotator_threshold_deg);
+    fprintf(f, "doppler_threshold = %.1f\n", cfg->pass.doppler_threshold_khz);
+    fprintf(f, "preposition_margin = %d\n", cfg->pass.preposition_margin_sec);
 
     fclose(f);
 

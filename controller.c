@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <math.h>
 
 #include "sgp4.h"
 #include "nmea.h"
@@ -196,6 +197,71 @@ typedef struct executor_command_message {
 } executor_command_message_t;
 
 // ============================================================================
+// Rotator Command Types
+// ============================================================================
+
+// Commands sent from pass executor to rotator command task
+typedef enum rotator_command_type {
+    ROT_CMD_GOTO,              // Move to specified az/el
+    ROT_CMD_STOP,              // Stop movement
+    ROT_CMD_PARK               // Return to park position (az=0, el=0)
+} rotator_command_type_t;
+
+// Message from pass executor to rotator command task
+typedef struct rotator_command_message {
+    rotator_command_type_t command;
+    double target_azimuth_rad;    // For ROT_CMD_GOTO
+    double target_elevation_rad;  // For ROT_CMD_GOTO
+} rotator_command_message_t;
+
+// ============================================================================
+// Pass Executor State
+// ============================================================================
+
+typedef enum executor_state {
+    EXEC_STATE_IDLE,           // No pass in progress
+    EXEC_STATE_PREPOSITIONING, // Moving antenna to AOS position
+    EXEC_STATE_WAITING_AOS,    // Antenna positioned, waiting for AOS
+    EXEC_STATE_TRACKING,       // Active satellite tracking
+    EXEC_STATE_COMPLETING      // Pass ending, cleanup
+} executor_state_t;
+
+typedef struct executor_tracking_state {
+    // Current state machine position
+    executor_state_t state;
+
+    // Pass being executed
+    pass_info_t current_pass;
+
+    // Satellite SGP4 state (copied from TLE database at pass start)
+    sgp4_state_t sat_state;
+    bool sat_state_valid;
+
+    // Satellite name for display
+    char sat_name[SGP4_TLE_NAME_LEN];
+
+    // Last commanded rotator position (radians)
+    double last_cmd_azimuth_rad;
+    double last_cmd_elevation_rad;
+    bool rotator_commanded;
+
+    // Current calculated satellite position (radians)
+    double current_azimuth_rad;
+    double current_elevation_rad;
+    double current_range_km;
+
+    // Doppler tracking state
+    double last_doppler_factor;    // Last applied doppler factor (ratio)
+    bool doppler_valid;
+
+    // Velocity components for doppler calculation (km/s)
+    double range_rate_km_s;        // Radial velocity toward/away from observer
+} executor_tracking_state_t;
+
+// Global executor state
+static executor_tracking_state_t g_executor_state;
+
+// ============================================================================
 // Pass Scheduling State
 // ============================================================================
 
@@ -293,6 +359,10 @@ static rtems_id g_ctrl_cmd_queue;
 // Pass executor command queue (controller -> executor)
 static rtems_id g_executor_cmd_queue;
 
+// Rotator command queue (executor -> rotator command task)
+static rtems_id g_rotator_cmd_queue;
+static rtems_id g_rotator_cmd_task_id;
+
 // Pass priority queue and scheduling state
 static pass_priority_queue_t g_upcoming_passes;
 static scheduled_pass_t g_scheduled_pass;
@@ -306,6 +376,7 @@ static rtems_id g_status_task_id;
 
 #define PRIORITY_PASS_EXECUTOR  10
 #define PRIORITY_CONTROLLER     20
+#define PRIORITY_ROTATOR_CMD    25
 #define PRIORITY_ROTATOR_STATUS 30
 #define PRIORITY_RADIO_STATUS   35
 #define PRIORITY_RADIO_FREQ     36
@@ -1872,6 +1943,22 @@ rtems_task status_task(rtems_task_argument arg) {
         // TLE database status
         LOG_INFO("STATUS", "TLE: %d satellites loaded", sat_count);
 
+        // Tracking status
+        {
+            executor_state_t exec_state = g_executor_state.state;
+
+            if (exec_state == EXEC_STATE_TRACKING) {
+                LOG_INFO("STATUS", "TRACKING: %s (NORAD %d)",
+                         g_executor_state.sat_name,
+                         g_executor_state.current_pass.norad_id);
+            } else if (exec_state == EXEC_STATE_PREPOSITIONING ||
+                       exec_state == EXEC_STATE_WAITING_AOS) {
+                LOG_INFO("STATUS", "PREPARING: %s (NORAD %d)",
+                         g_executor_state.sat_name,
+                         g_executor_state.current_pass.norad_id);
+            }
+        }
+
         // Upcoming passes status
         {
             config_t pass_cfg;
@@ -2354,77 +2441,571 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
     }
 }
 
+// ============================================================================
+// Pass Executor Helper Functions
+// ============================================================================
+
+/* Speed of light in km/s */
+#define C_KM_S 299792.458
+
+/* Earth rotation rate in rad/s */
+#define OMEGA_EARTH 7.292115e-5
+
+/*
+ * Look up satellite in TLE database and copy its SGP4 state.
+ * Returns true if found, false otherwise.
+ * Caller must hold g_tle_database_mutex.
+ */
+static bool get_satellite_state(int norad_id, sgp4_state_t *state_out,
+                                 char *name_out, size_t name_size)
+{
+    for (int i = 0; i < g_state.satellite_count && i < MAX_SATELLITES; i++) {
+        if (g_state.satellites[i].valid &&
+            g_state.satellites[i].tle.norad_id == norad_id) {
+            *state_out = g_state.satellites[i].state;
+            if (name_out && name_size > 0) {
+                strncpy(name_out, g_state.satellites[i].tle.name, name_size - 1);
+                name_out[name_size - 1] = '\0';
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Calculate Doppler shift factor from satellite velocity.
+ *
+ * The Doppler shift for radio frequencies is:
+ *   f_received = f_transmitted * (1 - v_radial / c)
+ *
+ * Where v_radial is the radial velocity (positive = moving away).
+ *
+ * Returns the factor to multiply the nominal frequency by.
+ * For approaching satellite: factor > 1 (frequency shifts up)
+ * For receding satellite: factor < 1 (frequency shifts down)
+ *
+ * @param sat_ecef        Satellite position in ECEF (km)
+ * @param sat_vel_ecef    Satellite velocity in ECEF (km/s)
+ * @param obs_ecef        Observer position in ECEF (km)
+ * @param range_rate_out  Output: range rate in km/s (positive = moving away)
+ * @return                Doppler factor (multiply nominal freq by this)
+ */
+static double calculate_doppler_factor(
+    const sgp4_vec3_t *sat_ecef,
+    const sgp4_vec3_t *sat_vel_ecef,
+    const sgp4_vec3_t *obs_ecef,
+    double *range_rate_out)
+{
+    /* Calculate range vector (observer to satellite) */
+    sgp4_vec3_t range_vec;
+    range_vec.x = sat_ecef->x - obs_ecef->x;
+    range_vec.y = sat_ecef->y - obs_ecef->y;
+    range_vec.z = sat_ecef->z - obs_ecef->z;
+
+    /* Normalize range vector to get unit vector */
+    double range_mag = sgp4_vec3_magnitude(&range_vec);
+    if (range_mag < 0.001) {
+        /* Degenerate case - satellite at observer */
+        if (range_rate_out) *range_rate_out = 0.0;
+        return 1.0;
+    }
+
+    sgp4_vec3_t range_unit;
+    range_unit.x = range_vec.x / range_mag;
+    range_unit.y = range_vec.y / range_mag;
+    range_unit.z = range_vec.z / range_mag;
+
+    /* Range rate = dot product of velocity and unit range vector */
+    /* Positive means moving away, negative means approaching */
+    double range_rate = sgp4_vec3_dot(sat_vel_ecef, &range_unit);
+
+    if (range_rate_out) *range_rate_out = range_rate;
+
+    /* Doppler factor: approaching (negative range_rate) increases frequency */
+    return 1.0 - (range_rate / C_KM_S);
+}
+
+/*
+ * Calculate satellite position, look angles, and Doppler factor at a given time.
+ * Returns true on success.
+ */
+static bool calculate_tracking_data(
+    const sgp4_state_t *sat_state,
+    const sgp4_geodetic_t *observer,
+    double jd,
+    sgp4_look_angles_t *angles_out,
+    double *doppler_factor_out,
+    double *range_rate_out)
+{
+    /* Calculate minutes since TLE epoch */
+    double epoch_jd = sat_state->jdsatepoch + sat_state->jdsatepochF;
+    double tsince_min = (jd - epoch_jd) * 1440.0;
+
+    /* Propagate satellite position and velocity */
+    sgp4_result_t result;
+    sgp4_error_t err = sgp4_propagate(sat_state, tsince_min, &result);
+    if (err != SGP4_SUCCESS) {
+        return false;
+    }
+
+    /* Get Greenwich Sidereal Time */
+    double gst = sgp4_gstime(jd);
+
+    /* Convert satellite position ECI to ECEF */
+    sgp4_vec3_t sat_eci = { result.r[0], result.r[1], result.r[2] };
+    sgp4_vec3_t sat_ecef;
+    sgp4_eci_to_ecef(&sat_eci, gst, &sat_ecef);
+
+    /* Calculate look angles */
+    sgp4_look_angles(&sat_ecef, observer, angles_out);
+
+    /* Convert satellite velocity ECI to ECEF */
+    /* v_ecef = R * v_eci - omega x r_ecef */
+    sgp4_vec3_t vel_eci = { result.v[0], result.v[1], result.v[2] };
+    sgp4_vec3_t vel_ecef;
+
+    double cos_gst = cos(gst);
+    double sin_gst = sin(gst);
+
+    vel_ecef.x = cos_gst * vel_eci.x + sin_gst * vel_eci.y + OMEGA_EARTH * sat_ecef.y;
+    vel_ecef.y = -sin_gst * vel_eci.x + cos_gst * vel_eci.y - OMEGA_EARTH * sat_ecef.x;
+    vel_ecef.z = vel_eci.z;
+
+    /* Convert observer to ECEF */
+    sgp4_vec3_t obs_ecef;
+    sgp4_geodetic_to_ecef(observer, &obs_ecef);
+
+    /* Calculate Doppler factor */
+    *doppler_factor_out = calculate_doppler_factor(&sat_ecef, &vel_ecef, &obs_ecef,
+                                                    range_rate_out);
+
+    return true;
+}
+
+// ============================================================================
+// Pass Executor State Machine Handlers
+// ============================================================================
+
+/* Forward declarations */
+static void handle_start_pass(const pass_info_t *pass);
+static void handle_abort_pass(void);
+static void process_prepositioning(double current_jd, const sgp4_geodetic_t *observer);
+static void process_waiting_aos(double current_jd);
+static void process_tracking(double current_jd, const sgp4_geodetic_t *observer,
+                             double rot_threshold_rad, double doppler_threshold_khz);
+static void process_completing(void);
+
+/*
+ * Handle START_PASS command.
+ */
+static void handle_start_pass(const pass_info_t *pass) {
+    /* Log pass details */
+    double aos_unix = sgp4_jd_to_unix(pass->aos_jd);
+    struct tm *aos_tm = gmtime((time_t *)&aos_unix);
+
+    LOG_INFO("EXEC", "Starting pass for NORAD %d", pass->norad_id);
+    LOG_INFO("EXEC", "  AOS: %02d:%02d:%02d, az=%.1f deg",
+             aos_tm->tm_hour, aos_tm->tm_min, aos_tm->tm_sec,
+             pass->aos_azimuth_rad * SGP4_RAD_TO_DEG);
+    LOG_INFO("EXEC", "  Max elevation: %.1f deg",
+             pass->max_elevation_rad * SGP4_RAD_TO_DEG);
+
+    /* Copy satellite state from TLE database */
+    rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+    bool found = get_satellite_state(pass->norad_id,
+                                      &g_executor_state.sat_state,
+                                      g_executor_state.sat_name,
+                                      sizeof(g_executor_state.sat_name));
+    rtems_semaphore_release(g_tle_database_mutex);
+
+    if (!found) {
+        LOG_ERROR("EXEC", "Satellite NORAD %d not found in TLE database",
+                  pass->norad_id);
+        return;
+    }
+
+    /* Initialize tracking state */
+    g_executor_state.current_pass = *pass;
+    g_executor_state.sat_state_valid = true;
+    g_executor_state.rotator_commanded = false;
+    g_executor_state.doppler_valid = false;
+    g_executor_state.last_doppler_factor = 1.0;
+
+    /* Send preposition command */
+    rotator_command_message_t rot_cmd;
+    rot_cmd.command = ROT_CMD_GOTO;
+    rot_cmd.target_azimuth_rad = pass->aos_azimuth_rad;
+    rot_cmd.target_elevation_rad = 0.0;  /* Start at horizon */
+
+    rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
+
+    g_executor_state.last_cmd_azimuth_rad = pass->aos_azimuth_rad;
+    g_executor_state.last_cmd_elevation_rad = 0.0;
+    g_executor_state.rotator_commanded = true;
+
+    LOG_INFO("EXEC", "Prepositioning antenna to az=%.1f el=0.0",
+             pass->aos_azimuth_rad * SGP4_RAD_TO_DEG);
+
+    g_executor_state.state = EXEC_STATE_PREPOSITIONING;
+}
+
+/*
+ * Handle ABORT_PASS command.
+ */
+static void handle_abort_pass(void) {
+    LOG_WARN("EXEC", "Aborting pass for NORAD %d",
+             g_executor_state.current_pass.norad_id);
+
+    /* Send stop command to rotator */
+    rotator_command_message_t rot_cmd;
+    rot_cmd.command = ROT_CMD_STOP;
+    rot_cmd.target_azimuth_rad = 0.0;
+    rot_cmd.target_elevation_rad = 0.0;
+    rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
+
+    /* Reset state */
+    g_executor_state.state = EXEC_STATE_IDLE;
+    g_executor_state.sat_state_valid = false;
+    g_executor_state.rotator_commanded = false;
+    g_executor_state.doppler_valid = false;
+}
+
+/*
+ * Process PREPOSITIONING state.
+ * Transition to WAITING_AOS when close to AOS time.
+ */
+static void process_prepositioning(double current_jd,
+                                    const sgp4_geodetic_t *observer) {
+    (void)observer;
+    config_t cfg;
+    config_get_copy(&cfg);
+    double prepos_margin_jd = cfg.pass.preposition_margin_sec / 86400.0;
+
+    double time_to_aos = g_executor_state.current_pass.aos_jd - current_jd;
+
+    if (time_to_aos <= prepos_margin_jd) {
+        LOG_INFO("EXEC", "Preposition complete, waiting for AOS (%.0f sec)",
+                 time_to_aos * 86400.0);
+        g_executor_state.state = EXEC_STATE_WAITING_AOS;
+    }
+}
+
+/*
+ * Process WAITING_AOS state.
+ * Transition to TRACKING when satellite rises above horizon.
+ */
+static void process_waiting_aos(double current_jd) {
+    if (current_jd >= g_executor_state.current_pass.aos_jd) {
+        LOG_INFO("EXEC", "AOS - Beginning tracking of %s",
+                 g_executor_state.sat_name);
+        g_executor_state.state = EXEC_STATE_TRACKING;
+    }
+}
+
+/*
+ * Process TRACKING state.
+ * Update rotator and radio as needed.
+ */
+static void process_tracking(double current_jd, const sgp4_geodetic_t *observer,
+                             double rot_threshold_rad, double doppler_threshold_khz) {
+    /* Check if pass has ended */
+    if (current_jd >= g_executor_state.current_pass.los_jd) {
+        LOG_INFO("EXEC", "LOS - Pass complete for %s",
+                 g_executor_state.sat_name);
+        g_executor_state.state = EXEC_STATE_COMPLETING;
+        return;
+    }
+
+    /* Calculate current satellite position and doppler */
+    sgp4_look_angles_t angles;
+    double doppler_factor;
+    double range_rate;
+
+    if (!calculate_tracking_data(&g_executor_state.sat_state, observer, current_jd,
+                                  &angles, &doppler_factor, &range_rate)) {
+        LOG_WARN("EXEC", "SGP4 propagation failed");
+        return;
+    }
+
+    /* Update tracking state */
+    g_executor_state.current_azimuth_rad = angles.azimuth_rad;
+    g_executor_state.current_elevation_rad = angles.elevation_rad;
+    g_executor_state.current_range_km = angles.range_km;
+    g_executor_state.range_rate_km_s = range_rate;
+
+    /* Check if rotator needs update */
+    double az_diff = fabs(angles.azimuth_rad - g_executor_state.last_cmd_azimuth_rad);
+    double el_diff = fabs(angles.elevation_rad - g_executor_state.last_cmd_elevation_rad);
+
+    /* Handle azimuth wraparound */
+    if (az_diff > SGP4_PI) {
+        az_diff = SGP4_TWO_PI - az_diff;
+    }
+
+    if (az_diff >= rot_threshold_rad || el_diff >= rot_threshold_rad) {
+        rotator_command_message_t rot_cmd;
+        rot_cmd.command = ROT_CMD_GOTO;
+        rot_cmd.target_azimuth_rad = angles.azimuth_rad;
+        rot_cmd.target_elevation_rad = angles.elevation_rad;
+
+        rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
+
+        g_executor_state.last_cmd_azimuth_rad = angles.azimuth_rad;
+        g_executor_state.last_cmd_elevation_rad = angles.elevation_rad;
+
+        LOG_DEBUG("EXEC", "Rotator: az=%.1f el=%.1f deg",
+                  angles.azimuth_rad * SGP4_RAD_TO_DEG,
+                  angles.elevation_rad * SGP4_RAD_TO_DEG);
+    }
+
+    /* Check if doppler correction needs update */
+    /* Use 145.9 MHz as reference for threshold calculation */
+    double doppler_diff_hz = fabs(doppler_factor - g_executor_state.last_doppler_factor) *
+                             145.9e6;
+
+    if (!g_executor_state.doppler_valid ||
+        doppler_diff_hz >= (doppler_threshold_khz * 1000.0)) {
+        g_executor_state.last_doppler_factor = doppler_factor;
+        g_executor_state.doppler_valid = true;
+
+        /* Log doppler info (actual frequency commands stubbed out for now) */
+        double shift_hz = (doppler_factor - 1.0) * 145.9e6;
+        LOG_DEBUG("EXEC", "Doppler: factor=%.9f, shift=%.0f Hz at 145.9 MHz",
+                  doppler_factor, shift_hz);
+
+        /* TODO: Send radio frequency command */
+        /* radio_set_doppler_offset(doppler_factor); */
+    }
+}
+
+/*
+ * Process COMPLETING state.
+ * Clean up and return to IDLE.
+ */
+static void process_completing(void) {
+    /* Park the rotator */
+    rotator_command_message_t rot_cmd;
+    rot_cmd.command = ROT_CMD_PARK;
+    rot_cmd.target_azimuth_rad = 0.0;
+    rot_cmd.target_elevation_rad = 0.0;
+    rtems_message_queue_send(g_rotator_cmd_queue, &rot_cmd, sizeof(rot_cmd));
+
+    LOG_INFO("EXEC", "Pass completed, returning to idle");
+
+    g_executor_state.state = EXEC_STATE_IDLE;
+    g_executor_state.sat_state_valid = false;
+    g_executor_state.rotator_commanded = false;
+    g_executor_state.doppler_valid = false;
+}
+
+// ============================================================================
+// Pass Executor Task
+// ============================================================================
+
 /*
  * Pass Executor Task
  *
  * Executes satellite passes by controlling the rotator and radio.
  * Receives commands from the controller via g_executor_cmd_queue.
- * Communicates with the rotator via UART (ttyS2) and radio via UART (ttyS3).
- *
- * NOTE: This is a stub implementation. Full tracking will be added in a future update.
+ * Maintains real-time tracking state and sends commands via g_rotator_cmd_queue.
  */
 rtems_task pass_executor_task(rtems_task_argument arg) {
     (void)arg;
     LOG_INFO("EXEC", "Pass executor task started");
 
+    /* Initialize state */
+    memset(&g_executor_state, 0, sizeof(g_executor_state));
+    g_executor_state.state = EXEC_STATE_IDLE;
+
     while (true) {
-        /* Wait for command from controller */
+        /* Get configuration */
+        config_t cfg;
+        config_get_copy(&cfg);
+
+        int poll_ms = cfg.pass.tracking_poll_ms;
+        double rot_threshold_rad = cfg.pass.rotator_threshold_deg * SGP4_DEG_TO_RAD;
+        double doppler_threshold_khz = cfg.pass.doppler_threshold_khz;
+
+        /* Calculate tick count for poll interval */
+        rtems_interval poll_ticks = (poll_ms * rtems_clock_get_ticks_per_second()) / 1000;
+        if (poll_ticks < 1) poll_ticks = 1;
+
+        /* Check for commands from controller */
         executor_command_message_t cmd;
+        size_t size;
+        rtems_status_code status;
+
+        if (g_executor_state.state == EXEC_STATE_IDLE) {
+            /* Blocking wait when idle */
+            status = rtems_message_queue_receive(
+                g_executor_cmd_queue, &cmd, &size,
+                RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+        } else {
+            /* Non-blocking check during tracking */
+            status = rtems_message_queue_receive(
+                g_executor_cmd_queue, &cmd, &size,
+                RTEMS_NO_WAIT, 0);
+        }
+
+        /* Process command if received */
+        if (status == RTEMS_SUCCESSFUL) {
+            switch (cmd.command) {
+                case EXEC_CMD_START_PASS:
+                    handle_start_pass(&cmd.pass);
+                    break;
+
+                case EXEC_CMD_ABORT_PASS:
+                    handle_abort_pass();
+                    break;
+
+                default:
+                    LOG_WARN("EXEC", "Unknown command type: %d", cmd.command);
+                    break;
+            }
+        }
+
+        /* State machine processing */
+        if (g_executor_state.state != EXEC_STATE_IDLE) {
+            /* Get current time */
+            rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+            time_t current_time = g_state.current_time;
+            bool time_valid = g_state.time_valid;
+            sgp4_geodetic_t observer = g_state.observer_location;
+            bool location_valid = g_state.location_valid;
+            rtems_semaphore_release(g_state_mutex);
+
+            if (!time_valid || !location_valid) {
+                LOG_WARN("EXEC", "GPS not available during tracking");
+                rtems_task_wake_after(poll_ticks);
+                continue;
+            }
+
+            double current_jd = sgp4_unix_to_jd((double)current_time);
+
+            switch (g_executor_state.state) {
+                case EXEC_STATE_PREPOSITIONING:
+                    process_prepositioning(current_jd, &observer);
+                    break;
+
+                case EXEC_STATE_WAITING_AOS:
+                    process_waiting_aos(current_jd);
+                    break;
+
+                case EXEC_STATE_TRACKING:
+                    process_tracking(current_jd, &observer, rot_threshold_rad,
+                                     doppler_threshold_khz);
+                    break;
+
+                case EXEC_STATE_COMPLETING:
+                    process_completing();
+                    break;
+
+                default:
+                    break;
+            }
+
+            /* Sleep for poll interval */
+            rtems_task_wake_after(poll_ticks);
+        }
+    }
+}
+
+// ============================================================================
+// Rotator Command Task
+// ============================================================================
+
+/*
+ * Rotator Command Task
+ *
+ * Receives rotator commands from the pass executor and sends
+ * GS-232A protocol commands to the rotator via UART.
+ */
+rtems_task rotator_command_task(rtems_task_argument arg) {
+    (void)arg;
+    LOG_INFO("ROTCMD", "Rotator command task started");
+
+    /* Command buffer for GS-232A protocol */
+    char cmd_buf[32];
+
+    while (true) {
+        /* Wait for command */
+        rotator_command_message_t cmd;
         size_t size;
 
         rtems_status_code status = rtems_message_queue_receive(
-            g_executor_cmd_queue, &cmd, &size,
+            g_rotator_cmd_queue, &cmd, &size,
             RTEMS_WAIT, RTEMS_NO_TIMEOUT);
 
         if (status != RTEMS_SUCCESSFUL) {
-            LOG_ERROR("EXEC", "Failed to receive command: %d", status);
+            LOG_ERROR("ROTCMD", "Failed to receive command: %d", status);
             rtems_task_wake_after(rtems_clock_get_ticks_per_second());
             continue;
         }
 
+        /* Check if rotator is available */
+        if (g_rotator_fd < 0) {
+            LOG_WARN("ROTCMD", "Rotator not connected");
+            continue;
+        }
+
+        /* Process command */
         switch (cmd.command) {
-            case EXEC_CMD_START_PASS: {
-                /* Log pass details */
-                double aos_unix = sgp4_jd_to_unix(cmd.pass.aos_jd);
-                double los_unix = sgp4_jd_to_unix(cmd.pass.los_jd);
-                struct tm *aos_tm = gmtime((time_t *)&aos_unix);
-                struct tm *los_tm = gmtime((time_t *)&los_unix);
+            case ROT_CMD_GOTO: {
+                /* Convert radians to integer degrees for GS-232A */
+                int az_deg = (int)(cmd.target_azimuth_rad * SGP4_RAD_TO_DEG + 0.5);
+                int el_deg = (int)(cmd.target_elevation_rad * SGP4_RAD_TO_DEG + 0.5);
 
-                LOG_INFO("EXEC", "Received START_PASS for NORAD %d", cmd.pass.norad_id);
-                LOG_INFO("EXEC", "  AOS: %02d:%02d:%02d, az=%.1f deg",
-                         aos_tm->tm_hour, aos_tm->tm_min, aos_tm->tm_sec,
-                         cmd.pass.aos_azimuth_rad * SGP4_RAD_TO_DEG);
-                LOG_INFO("EXEC", "  LOS: %02d:%02d:%02d, az=%.1f deg",
-                         los_tm->tm_hour, los_tm->tm_min, los_tm->tm_sec,
-                         cmd.pass.los_azimuth_rad * SGP4_RAD_TO_DEG);
-                LOG_INFO("EXEC", "  Max elevation: %.1f deg",
-                         cmd.pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                /* Clamp values to valid ranges */
+                if (az_deg < 0) az_deg += 360;
+                if (az_deg >= 360) az_deg -= 360;
+                if (el_deg < 0) el_deg = 0;
+                if (el_deg > 90) el_deg = 90;
 
-                /*
-                 * TODO (future update): Implement actual pass tracking:
-                 * 1. Open rotator serial port
-                 * 2. Open radio serial port
-                 * 3. Pre-position antenna to AOS azimuth/elevation
-                 * 4. During pass:
-                 *    - Calculate current satellite position using SGP4
-                 *    - Send rotator commands to track satellite
-                 *    - Apply Doppler correction to radio frequency
-                 *    - Handle data reception/transmission
-                 * 5. Close serial ports when pass completes
-                 * 6. Notify controller of completion
-                 */
+                /* Format GS-232A command: W<az> <el>\r */
+                /* W command moves to absolute position */
+                int len = snprintf(cmd_buf, sizeof(cmd_buf), "W%03d %03d\r",
+                                   az_deg, el_deg);
+
+                /* Send to rotator */
+                rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+                write(g_rotator_fd, cmd_buf, len);
+                fsync(g_rotator_fd);
+                rtems_semaphore_release(g_uart1_mutex);
+
+                LOG_DEBUG("ROTCMD", "Sent: W%03d %03d", az_deg, el_deg);
                 break;
             }
 
-            case EXEC_CMD_ABORT_PASS:
-                LOG_WARN("EXEC", "Received ABORT_PASS command");
-                /* TODO: Stop tracking, return to safe position */
+            case ROT_CMD_STOP: {
+                /* GS-232A stop command: S\r */
+                rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+                write(g_rotator_fd, "S\r", 2);
+                fsync(g_rotator_fd);
+                rtems_semaphore_release(g_uart1_mutex);
+
+                LOG_DEBUG("ROTCMD", "Sent: S (stop)");
                 break;
+            }
+
+            case ROT_CMD_PARK: {
+                /* Park at az=0, el=0 */
+                rtems_semaphore_obtain(g_uart1_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+                write(g_rotator_fd, "W000 000\r", 9);
+                fsync(g_rotator_fd);
+                rtems_semaphore_release(g_uart1_mutex);
+
+                LOG_DEBUG("ROTCMD", "Sent: W000 000 (park)");
+                break;
+            }
 
             default:
-                LOG_WARN("EXEC", "Unknown command type: %d", cmd.command);
+                LOG_WARN("ROTCMD", "Unknown command: %d", cmd.command);
                 break;
         }
+
+        /* Small delay between commands to avoid flooding rotator */
+        rtems_task_wake_after(rtems_clock_get_ticks_per_second() / 20);  /* 50ms */
     }
 }
 
@@ -2850,6 +3431,19 @@ static rtems_status_code create_message_queues(void) {
         return status;
     }
 
+    // Rotator command queue (executor -> rotator command task)
+    status = rtems_message_queue_create(
+        rtems_build_name('R', 'O', 'T', 'C'),
+        8,  // Allow buffering of commands during fast tracking
+        sizeof(rotator_command_message_t),
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_rotator_cmd_queue
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create rotator command queue: %d", status);
+        return status;
+    }
+
     // Initialize pass priority queue
     pass_queue_init(&g_upcoming_passes);
     memset(&g_scheduled_pass, 0, sizeof(g_scheduled_pass));
@@ -3061,6 +3655,20 @@ static rtems_status_code create_and_start_tasks(void) {
         return status;
     }
 
+    // Create Rotator Command task
+    status = rtems_task_create(
+        rtems_build_name('R', 'O', 'T', 'C'),
+        PRIORITY_ROTATOR_CMD,
+        TASK_STACK_SIZE,
+        RTEMS_DEFAULT_MODES,
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_rotator_cmd_task_id
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create rotator command task: %d", status);
+        return status;
+    }
+
     // Create Controller task
     status = rtems_task_create(
         rtems_build_name('C', 'T', 'R', 'L'),
@@ -3114,6 +3722,9 @@ static rtems_status_code create_and_start_tasks(void) {
     if (status != RTEMS_SUCCESSFUL) return status;
 
     status = rtems_task_start(g_pass_executor_task_id, pass_executor_task, 0);
+    if (status != RTEMS_SUCCESSFUL) return status;
+
+    status = rtems_task_start(g_rotator_cmd_task_id, rotator_command_task, 0);
     if (status != RTEMS_SUCCESSFUL) return status;
 
     status = rtems_task_start(g_controller_task_id, controller_task, 0);
