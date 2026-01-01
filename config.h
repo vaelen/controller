@@ -106,6 +106,18 @@ typedef struct network_config {
 } network_config_t;
 
 /*
+ * Pass prediction and scheduling configuration.
+ */
+typedef struct pass_config {
+    int prediction_window_min;     /* How far ahead to predict (default: 60) */
+    double min_elevation_deg;      /* Minimum elevation for pass detection (default: 5.0) */
+    double min_schedule_elevation_deg; /* Min max-elevation to schedule pass (default: 15.0) */
+    int prep_time_sec;             /* Time before AOS to start prep (default: 300) */
+    int calc_interval_sec;         /* How often to recalculate (default: 300) */
+    int status_display_count;      /* Number of passes to show in status (default: 5) */
+} pass_config_t;
+
+/*
  * Complete configuration structure.
  */
 typedef struct config {
@@ -129,6 +141,9 @@ typedef struct config {
     int satellite_norad_ids[CONFIG_MAX_NORAD_IDS];
     int satellite_count;
     int tle_update_interval_hours;
+
+    /* Pass prediction configuration */
+    pass_config_t pass;
 
     /* System settings */
     int log_level;              /* LOG_LEVEL_DEBUG through LOG_LEVEL_ERROR */

@@ -128,30 +128,9 @@ typedef struct radio_status_message {
     uint8_t active_vfo;       // 0=VFO-A, 1=VFO-B
 } radio_status_message_t;
 
-// Maximum number of steps in a pass plan
-#define MAX_PASS_PLAN_STEPS 64
-
-// Pass plan step - a single point in time during a satellite pass
-typedef struct pass_plan_step {
-    double timestamp_jd;      // Julian Date of this step
-    double azimuth_rad;       // Antenna azimuth (radians)
-    double elevation_rad;     // Antenna elevation (radians)
-    uint64_t rx_freq_hz;      // Receive frequency (Hz)
-    uint64_t tx_freq_hz;      // Transmit frequency (Hz)
-} pass_plan_step_t;
-
-// Pass information structure
-typedef struct pass_info {
-    int norad_id;
-    double aos_jd;           // Acquisition of signal (Julian Date)
-    double los_jd;           // Loss of signal (Julian Date)
-    double max_elevation_rad;
-    double aos_azimuth_rad;
-    double los_azimuth_rad;
-    // Pass plan - precomputed tracking points
-    pass_plan_step_t plan[MAX_PASS_PLAN_STEPS];
-    int plan_step_count;     // Number of valid steps in plan array
-} pass_info_t;
+// Pass information is now defined in priority_queue.h
+// (pass_info_t no longer includes plan steps - those are generated on-the-fly by executor)
+#include "priority_queue.h"
 
 // GPS position and time update message
 typedef struct gps_message {
@@ -199,6 +178,33 @@ typedef union controller_message {
 typedef struct ctrl_cmd_message {
     message_type_t type;
 } ctrl_cmd_message_t;
+
+// ============================================================================
+// Pass Executor Command Types
+// ============================================================================
+
+// Commands sent from controller to pass executor
+typedef enum executor_command_type {
+    EXEC_CMD_START_PASS,       // Begin tracking a satellite pass
+    EXEC_CMD_ABORT_PASS        // Abort the current pass
+} executor_command_type_t;
+
+// Message from controller to pass executor
+typedef struct executor_command_message {
+    executor_command_type_t command;
+    pass_info_t pass;          // Only valid for EXEC_CMD_START_PASS
+} executor_command_message_t;
+
+// ============================================================================
+// Pass Scheduling State
+// ============================================================================
+
+// Currently scheduled pass (waiting to execute or in-progress)
+typedef struct scheduled_pass {
+    bool active;               // True if a pass is scheduled
+    pass_info_t pass;          // The scheduled pass
+    bool prep_sent;            // True if start command sent to executor
+} scheduled_pass_t;
 
 // ============================================================================
 // Satellite entry for TLE database
@@ -260,6 +266,7 @@ static rtems_id g_pass_queue;
 static rtems_id g_uart1_mutex;
 static rtems_id g_tle_database_mutex;
 static rtems_id g_state_mutex;
+static rtems_id g_pass_queue_mutex;
 
 // Task IDs
 static rtems_id g_gps_task_id;
@@ -282,6 +289,13 @@ static int g_radio_fd = -1;
 
 // Controller command queue (for config reload, etc.)
 static rtems_id g_ctrl_cmd_queue;
+
+// Pass executor command queue (controller -> executor)
+static rtems_id g_executor_cmd_queue;
+
+// Pass priority queue and scheduling state
+static pass_priority_queue_t g_upcoming_passes;
+static scheduled_pass_t g_scheduled_pass;
 
 // Status task
 static rtems_id g_status_task_id;
@@ -1579,6 +1593,22 @@ static int load_tle_database(const char *filepath)
 }
 
 /*
+ * Find satellite name by NORAD ID.
+ * Must be called with g_tle_database_mutex held.
+ * Returns pointer to name string if found, NULL otherwise.
+ */
+static const char *find_satellite_name(int norad_id)
+{
+    for (int i = 0; i < g_state.satellite_count; i++) {
+        if (g_state.satellites[i].valid &&
+            g_state.satellites[i].tle.norad_id == norad_id) {
+            return g_state.satellites[i].tle.name;
+        }
+    }
+    return NULL;
+}
+
+/*
  * Check if network is available (has a valid IP address).
  */
 static bool network_is_available(const char *ifname)
@@ -1693,6 +1723,9 @@ rtems_task tle_updater_task(rtems_task_argument arg) {
         );
 
         if (downloaded > 0) {
+            /* Remove existing file first (required for FAT filesystems) */
+            unlink(TLE_FILE_PATH);
+
             /* Rename temp file to final location */
             if (rename(TLE_TEMP_FILE_PATH, TLE_FILE_PATH) != 0) {
                 LOG_ERROR("TLE", "Failed to rename temp file: %s", strerror(errno));
@@ -1839,6 +1872,88 @@ rtems_task status_task(rtems_task_argument arg) {
         // TLE database status
         LOG_INFO("STATUS", "TLE: %d satellites loaded", sat_count);
 
+        // Upcoming passes status
+        {
+            config_t pass_cfg;
+            config_get_copy(&pass_cfg);
+            int display_count = pass_cfg.pass.status_display_count;
+
+            /* Take a snapshot of pass scheduling state */
+            rtems_semaphore_obtain(g_pass_queue_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+            int queue_count = pass_queue_count(&g_upcoming_passes);
+            int total_passes = queue_count + (g_scheduled_pass.active ? 1 : 0);
+
+            /* Copy passes for display (scheduled pass + queue contents) */
+            pass_info_t display_passes[20];
+            int num_display = 0;
+
+            /* First add the scheduled pass if active */
+            if (g_scheduled_pass.active && num_display < display_count) {
+                display_passes[num_display++] = g_scheduled_pass.pass;
+            }
+
+            /* Then add passes from queue (they're in priority order) */
+            for (int i = 0; i < queue_count && num_display < display_count; i++) {
+                if (i < PASS_QUEUE_CAPACITY) {
+                    display_passes[num_display++] = g_upcoming_passes.passes[i];
+                }
+            }
+
+            rtems_semaphore_release(g_pass_queue_mutex);
+
+            LOG_INFO("STATUS", "Passes: %d upcoming", total_passes);
+
+            if (num_display > 0) {
+                /* Get satellite names from TLE database */
+                rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+                /* Print table header */
+                LOG_INFO("STATUS", "  %-20s %5s  %8s  %8s  %6s  %6s  %6s",
+                         "Satellite", "NORAD", "AOS", "LOS", "AOS Az", "LOS Az", "MaxEl");
+                LOG_INFO("STATUS", "  %-20s %5s  %8s  %8s  %6s  %6s  %6s",
+                         "--------------------", "-----", "--------", "--------",
+                         "------", "------", "------");
+
+                for (int i = 0; i < num_display; i++) {
+                    pass_info_t *p = &display_passes[i];
+
+                    /* Get satellite name */
+                    const char *name = find_satellite_name(p->norad_id);
+                    char name_buf[21];
+                    if (name) {
+                        strncpy(name_buf, name, 20);
+                        name_buf[20] = '\0';
+                    } else {
+                        snprintf(name_buf, sizeof(name_buf), "Unknown");
+                    }
+
+                    /* Convert times to HH:MM:SS */
+                    double aos_unix = sgp4_jd_to_unix(p->aos_jd);
+                    double los_unix = sgp4_jd_to_unix(p->los_jd);
+                    struct tm *aos_tm = gmtime((time_t *)&aos_unix);
+                    int aos_h = aos_tm->tm_hour;
+                    int aos_m = aos_tm->tm_min;
+                    int aos_s = aos_tm->tm_sec;
+                    struct tm *los_tm = gmtime((time_t *)&los_unix);
+                    int los_h = los_tm->tm_hour;
+                    int los_m = los_tm->tm_min;
+                    int los_s = los_tm->tm_sec;
+
+                    LOG_INFO("STATUS", "  %-20s %5d  %02d:%02d:%02d  %02d:%02d:%02d  %5.1f°  %5.1f°  %5.1f°",
+                             name_buf,
+                             p->norad_id,
+                             aos_h, aos_m, aos_s,
+                             los_h, los_m, los_s,
+                             p->aos_azimuth_rad * SGP4_RAD_TO_DEG,
+                             p->los_azimuth_rad * SGP4_RAD_TO_DEG,
+                             p->max_elevation_rad * SGP4_RAD_TO_DEG);
+                }
+
+                rtems_semaphore_release(g_tle_database_mutex);
+            }
+        }
+
         // Network status
         {
             config_t net_cfg;
@@ -1870,6 +1985,283 @@ rtems_task status_task(rtems_task_argument arg) {
     }
 }
 
+// ============================================================================
+// Pass Calculator Helper Functions
+// ============================================================================
+
+/* Time step for coarse pass scanning (seconds) */
+#define PASS_SCAN_STEP_SEC 60
+
+/* Buffer added to prediction window (minutes) */
+#define PASS_WINDOW_BUFFER_MIN 5
+
+/* Binary search precision (seconds) */
+#define PASS_REFINE_PRECISION_SEC 1.0
+
+/*
+ * Calculate look angles at a specific time.
+ * Returns true if calculation was successful.
+ */
+static bool calculate_look_angles_at_time(
+    const sgp4_state_t *sat_state,
+    const sgp4_geodetic_t *observer,
+    double jd,
+    sgp4_look_angles_t *angles)
+{
+    /* Calculate minutes since TLE epoch */
+    double epoch_jd = sat_state->jdsatepoch + sat_state->jdsatepochF;
+    double tsince_min = (jd - epoch_jd) * 1440.0;  /* days to minutes */
+
+    /* Propagate satellite position */
+    sgp4_result_t result;
+    sgp4_error_t err = sgp4_propagate(sat_state, tsince_min, &result);
+    if (err != SGP4_SUCCESS) {
+        return false;
+    }
+
+    /* Convert ECI to ECEF */
+    double gst = sgp4_gstime(jd);
+    sgp4_vec3_t eci = { result.r[0], result.r[1], result.r[2] };
+    sgp4_vec3_t ecef;
+    sgp4_eci_to_ecef(&eci, gst, &ecef);
+
+    /* Calculate look angles */
+    sgp4_look_angles(&ecef, observer, angles);
+
+    return true;
+}
+
+/*
+ * Refine a visibility transition (AOS or LOS) using binary search.
+ *
+ * @param sat_state      Satellite SGP4 state
+ * @param observer       Observer location
+ * @param t_before       Time when satellite was NOT visible
+ * @param t_after        Time when satellite WAS visible (for AOS)
+ * @param min_el_rad     Minimum elevation threshold
+ * @param looking_for_aos True if looking for AOS, false for LOS
+ * @return               Refined transition time as Julian Date
+ */
+static double refine_transition(
+    const sgp4_state_t *sat_state,
+    const sgp4_geodetic_t *observer,
+    double t_before,
+    double t_after,
+    double min_el_rad,
+    bool looking_for_aos)
+{
+    double precision_jd = PASS_REFINE_PRECISION_SEC / 86400.0;
+
+    while ((t_after - t_before) > precision_jd) {
+        double t_mid = (t_before + t_after) / 2.0;
+
+        sgp4_look_angles_t angles;
+        if (!calculate_look_angles_at_time(sat_state, observer, t_mid, &angles)) {
+            break;  /* Propagation error - return best estimate */
+        }
+
+        bool is_visible = angles.elevation_rad >= min_el_rad;
+
+        if (looking_for_aos) {
+            if (is_visible) {
+                t_after = t_mid;
+            } else {
+                t_before = t_mid;
+            }
+        } else {  /* looking for LOS */
+            if (is_visible) {
+                t_before = t_mid;
+            } else {
+                t_after = t_mid;
+            }
+        }
+    }
+
+    return (t_before + t_after) / 2.0;
+}
+
+/*
+ * Find maximum elevation during a pass using ternary search.
+ *
+ * @param sat_state  Satellite SGP4 state
+ * @param observer   Observer location
+ * @param aos_jd     Start of pass (AOS)
+ * @param los_jd     End of pass (LOS)
+ * @param max_el_out Output: maximum elevation in radians
+ * @return           True if successful
+ */
+static bool find_max_elevation(
+    const sgp4_state_t *sat_state,
+    const sgp4_geodetic_t *observer,
+    double aos_jd,
+    double los_jd,
+    double *max_el_out)
+{
+    double low = aos_jd;
+    double high = los_jd;
+    double precision_jd = 1.0 / 86400.0;  /* 1 second */
+
+    while ((high - low) > precision_jd) {
+        double mid1 = low + (high - low) / 3.0;
+        double mid2 = high - (high - low) / 3.0;
+
+        sgp4_look_angles_t angles1, angles2;
+        if (!calculate_look_angles_at_time(sat_state, observer, mid1, &angles1) ||
+            !calculate_look_angles_at_time(sat_state, observer, mid2, &angles2)) {
+            return false;
+        }
+
+        if (angles1.elevation_rad < angles2.elevation_rad) {
+            low = mid1;
+        } else {
+            high = mid2;
+        }
+    }
+
+    /* Get final elevation at peak */
+    sgp4_look_angles_t angles;
+    if (!calculate_look_angles_at_time(sat_state, observer, (low + high) / 2.0, &angles)) {
+        return false;
+    }
+
+    *max_el_out = angles.elevation_rad;
+    return true;
+}
+
+/*
+ * Find the next satellite pass within the given time window.
+ *
+ * @param sat_state    Satellite SGP4 state
+ * @param norad_id     Satellite NORAD ID
+ * @param observer     Observer location
+ * @param start_jd     Start of search window (Julian Date)
+ * @param end_jd       End of search window (Julian Date)
+ * @param min_el_rad   Minimum elevation for visibility
+ * @param pass_out     Output: found pass information
+ * @return             True if a pass was found
+ */
+static bool find_next_pass(
+    const sgp4_state_t *sat_state,
+    int norad_id,
+    const sgp4_geodetic_t *observer,
+    double start_jd,
+    double end_jd,
+    double min_el_rad,
+    pass_info_t *pass_out)
+{
+    double step_jd = PASS_SCAN_STEP_SEC / 86400.0;
+
+    /* Check if satellite is currently visible (skip in-progress passes) */
+    sgp4_look_angles_t initial_angles;
+    if (calculate_look_angles_at_time(sat_state, observer, start_jd, &initial_angles)) {
+        if (initial_angles.elevation_rad >= min_el_rad) {
+            /* Satellite is already visible - skip to find next pass */
+            /* Scan forward to find when it sets */
+            double t = start_jd;
+            bool was_visible = true;
+            while (t < end_jd && was_visible) {
+                t += step_jd;
+                sgp4_look_angles_t angles;
+                if (calculate_look_angles_at_time(sat_state, observer, t, &angles)) {
+                    was_visible = angles.elevation_rad >= min_el_rad;
+                } else {
+                    break;
+                }
+            }
+            /* Now start searching from when it set */
+            start_jd = t;
+        }
+    }
+
+    /* Coarse scan for AOS */
+    bool prev_visible = false;
+    double aos_approx = 0.0;
+    double los_approx = 0.0;
+    bool found_aos = false;
+
+    for (double t = start_jd; t < end_jd; t += step_jd) {
+        sgp4_look_angles_t angles;
+        if (!calculate_look_angles_at_time(sat_state, observer, t, &angles)) {
+            continue;  /* Propagation failed - skip this time point */
+        }
+
+        bool curr_visible = angles.elevation_rad >= min_el_rad;
+
+        if (!prev_visible && curr_visible) {
+            /* Found approximate AOS */
+            aos_approx = t;
+            found_aos = true;
+        } else if (prev_visible && !curr_visible && found_aos) {
+            /* Found approximate LOS */
+            los_approx = t;
+
+            /* Refine AOS */
+            double aos_refined = refine_transition(
+                sat_state, observer,
+                aos_approx - step_jd, aos_approx,
+                min_el_rad, true);
+
+            /* Refine LOS */
+            double los_refined = refine_transition(
+                sat_state, observer,
+                los_approx - step_jd, los_approx,
+                min_el_rad, false);
+
+            /* Find max elevation */
+            double max_el;
+            if (!find_max_elevation(sat_state, observer, aos_refined, los_refined, &max_el)) {
+                max_el = 0.1;  /* Default if calculation fails */
+            }
+
+            /* Get AOS and LOS azimuths */
+            sgp4_look_angles_t aos_angles, los_angles;
+            calculate_look_angles_at_time(sat_state, observer, aos_refined, &aos_angles);
+            calculate_look_angles_at_time(sat_state, observer, los_refined, &los_angles);
+
+            /* Populate pass info */
+            pass_out->norad_id = norad_id;
+            pass_out->aos_jd = aos_refined;
+            pass_out->los_jd = los_refined;
+            pass_out->max_elevation_rad = max_el;
+            pass_out->aos_azimuth_rad = aos_angles.azimuth_rad;
+            pass_out->los_azimuth_rad = los_angles.azimuth_rad;
+
+            return true;
+        }
+
+        prev_visible = curr_visible;
+    }
+
+    /* Check if pass extends beyond window */
+    if (found_aos && prev_visible) {
+        /* Pass started but didn't end within window - refine AOS and use window end */
+        double aos_refined = refine_transition(
+            sat_state, observer,
+            aos_approx - step_jd, aos_approx,
+            min_el_rad, true);
+
+        double max_el;
+        if (!find_max_elevation(sat_state, observer, aos_refined, end_jd, &max_el)) {
+            max_el = 0.1;
+        }
+
+        sgp4_look_angles_t aos_angles, los_angles;
+        calculate_look_angles_at_time(sat_state, observer, aos_refined, &aos_angles);
+        calculate_look_angles_at_time(sat_state, observer, end_jd, &los_angles);
+
+        pass_out->norad_id = norad_id;
+        pass_out->aos_jd = aos_refined;
+        pass_out->los_jd = end_jd;  /* Truncated to window */
+        pass_out->max_elevation_rad = max_el;
+        pass_out->aos_azimuth_rad = aos_angles.azimuth_rad;
+        pass_out->los_azimuth_rad = los_angles.azimuth_rad;
+
+        return true;
+    }
+
+    return false;
+}
+
 /*
  * Pass Calculator Task
  *
@@ -1881,17 +2273,84 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
     (void)arg;
     LOG_INFO("PASS", "Calculator task started");
 
-    while (true) {
-        // TODO: Acquire g_state_mutex to read observer locationz
-        // TODO: Acquire g_tle_database_mutex to read TLE database
-        // TODO: For each satellite in database:
-        //       - Propagate satellite position
-        //       - Calculate look angles
-        //       - If pass found within window, send pass_message_t to g_pass_queue
-        // TODO: Release mutexes
+    /* Wait for initial GPS fix and TLE load */
+    rtems_task_wake_after(10 * rtems_clock_get_ticks_per_second());
 
-        // Stub: simulate periodic pass calculation (every hour)
-        rtems_task_wake_after(60 * 60 * rtems_clock_get_ticks_per_second());
+    while (true) {
+        /* Get configuration */
+        config_t cfg;
+        config_get_copy(&cfg);
+
+        int prediction_window_min = cfg.pass.prediction_window_min;
+        double min_el_rad = cfg.pass.min_elevation_deg * SGP4_DEG_TO_RAD;
+        int calc_interval_sec = cfg.pass.calc_interval_sec;
+
+        /* Get current state snapshot */
+        rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+        bool location_valid = g_state.location_valid;
+        bool time_valid = g_state.time_valid;
+        sgp4_geodetic_t observer = g_state.observer_location;
+        time_t current_time = g_state.current_time;
+        rtems_semaphore_release(g_state_mutex);
+
+        if (!location_valid || !time_valid) {
+            LOG_DEBUG("PASS", "Waiting for GPS fix...");
+            rtems_task_wake_after(10 * rtems_clock_get_ticks_per_second());
+            continue;
+        }
+
+        /* Calculate time window */
+        double start_jd = sgp4_unix_to_jd((double)current_time);
+        double end_jd = start_jd + (prediction_window_min + PASS_WINDOW_BUFFER_MIN) / 1440.0;
+
+        int passes_found = 0;
+
+        /* Iterate over all satellites */
+        rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+        int sat_count = g_state.satellite_count;
+
+        for (int i = 0; i < sat_count && i < MAX_SATELLITES; i++) {
+            if (!g_state.satellites[i].valid) {
+                continue;
+            }
+
+            pass_info_t pass;
+            if (find_next_pass(&g_state.satellites[i].state,
+                               g_state.satellites[i].tle.norad_id,
+                               &observer,
+                               start_jd, end_jd,
+                               min_el_rad,
+                               &pass)) {
+
+                /* Send pass to controller */
+                pass_message_t msg;
+                msg.type = MSG_PASS_CALCULATED;
+                msg.pass = pass;
+
+                rtems_status_code status = rtems_message_queue_send(
+                    g_pass_queue, &msg, sizeof(msg));
+
+                if (status == RTEMS_SUCCESSFUL) {
+                    passes_found++;
+                    LOG_DEBUG("PASS", "Found pass: NORAD %d, max_el=%.1f deg",
+                              pass.norad_id,
+                              pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                } else if (status == RTEMS_TOO_MANY) {
+                    LOG_WARN("PASS", "Pass queue full, dropping pass for NORAD %d",
+                             pass.norad_id);
+                }
+            }
+        }
+
+        rtems_semaphore_release(g_tle_database_mutex);
+
+        if (passes_found > 0) {
+            LOG_INFO("PASS", "Found %d passes in next %d minutes",
+                     passes_found, prediction_window_min);
+        }
+
+        /* Sleep until next calculation cycle */
+        rtems_task_wake_after(calc_interval_sec * rtems_clock_get_ticks_per_second());
     }
 }
 
@@ -1899,27 +2358,73 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
  * Pass Executor Task
  *
  * Executes satellite passes by controlling the rotator and radio.
- * Started by the controller when a pass begins.
+ * Receives commands from the controller via g_executor_cmd_queue.
  * Communicates with the rotator via UART (ttyS2) and radio via UART (ttyS3).
+ *
+ * NOTE: This is a stub implementation. Full tracking will be added in a future update.
  */
 rtems_task pass_executor_task(rtems_task_argument arg) {
     (void)arg;
     LOG_INFO("EXEC", "Pass executor task started");
 
     while (true) {
-        // TODO: Wait for pass execution command from controller
-        // TODO: Open rotator serial port (ROTATOR_DEVICE_PATH)
-        // TODO: Open radio serial port (RADIO_DEVICE_PATH)
-        // TODO: During pass:
-        //       - Calculate current satellite position
-        //       - Send rotator commands to track satellite
-        //       - Configure radio frequency (Doppler correction)
-        //       - Handle data reception/transmission
-        // TODO: Close serial ports when pass completes
-        // TODO: Notify controller of pass completion
+        /* Wait for command from controller */
+        executor_command_message_t cmd;
+        size_t size;
 
-        // Stub: wait for pass execution trigger
-        rtems_task_wake_after(rtems_clock_get_ticks_per_second());
+        rtems_status_code status = rtems_message_queue_receive(
+            g_executor_cmd_queue, &cmd, &size,
+            RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+        if (status != RTEMS_SUCCESSFUL) {
+            LOG_ERROR("EXEC", "Failed to receive command: %d", status);
+            rtems_task_wake_after(rtems_clock_get_ticks_per_second());
+            continue;
+        }
+
+        switch (cmd.command) {
+            case EXEC_CMD_START_PASS: {
+                /* Log pass details */
+                double aos_unix = sgp4_jd_to_unix(cmd.pass.aos_jd);
+                double los_unix = sgp4_jd_to_unix(cmd.pass.los_jd);
+                struct tm *aos_tm = gmtime((time_t *)&aos_unix);
+                struct tm *los_tm = gmtime((time_t *)&los_unix);
+
+                LOG_INFO("EXEC", "Received START_PASS for NORAD %d", cmd.pass.norad_id);
+                LOG_INFO("EXEC", "  AOS: %02d:%02d:%02d, az=%.1f deg",
+                         aos_tm->tm_hour, aos_tm->tm_min, aos_tm->tm_sec,
+                         cmd.pass.aos_azimuth_rad * SGP4_RAD_TO_DEG);
+                LOG_INFO("EXEC", "  LOS: %02d:%02d:%02d, az=%.1f deg",
+                         los_tm->tm_hour, los_tm->tm_min, los_tm->tm_sec,
+                         cmd.pass.los_azimuth_rad * SGP4_RAD_TO_DEG);
+                LOG_INFO("EXEC", "  Max elevation: %.1f deg",
+                         cmd.pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+
+                /*
+                 * TODO (future update): Implement actual pass tracking:
+                 * 1. Open rotator serial port
+                 * 2. Open radio serial port
+                 * 3. Pre-position antenna to AOS azimuth/elevation
+                 * 4. During pass:
+                 *    - Calculate current satellite position using SGP4
+                 *    - Send rotator commands to track satellite
+                 *    - Apply Doppler correction to radio frequency
+                 *    - Handle data reception/transmission
+                 * 5. Close serial ports when pass completes
+                 * 6. Notify controller of completion
+                 */
+                break;
+            }
+
+            case EXEC_CMD_ABORT_PASS:
+                LOG_WARN("EXEC", "Received ABORT_PASS command");
+                /* TODO: Stop tracking, return to safe position */
+                break;
+
+            default:
+                LOG_WARN("EXEC", "Unknown command type: %d", cmd.command);
+                break;
+        }
     }
 }
 
@@ -2017,16 +2522,43 @@ rtems_task controller_task(rtems_task_argument arg) {
             }
         }
 
-        // Check pass queue for upcoming pass predictions
+        // Check pass queue for upcoming pass predictions and add to priority queue
         {
+            /* Get min schedule elevation from config */
+            config_t pass_filter_cfg;
+            config_get_copy(&pass_filter_cfg);
+            double min_sched_el_rad = pass_filter_cfg.pass.min_schedule_elevation_deg * SGP4_DEG_TO_RAD;
+
             pass_message_t pass_msg;
             size_t pass_size;
             while (rtems_message_queue_receive(g_pass_queue, &pass_msg, &pass_size,
                                                RTEMS_NO_WAIT, 0) == RTEMS_SUCCESSFUL) {
-                LOG_INFO("CTRL", "Pass: NORAD %d, max_el=%.1f deg",
-                         pass_msg.pass.norad_id,
-                         pass_msg.pass.max_elevation_rad * SGP4_RAD_TO_DEG);
-                // TODO: Schedule pass execution
+
+                /* Filter out passes with max elevation below threshold */
+                if (pass_msg.pass.max_elevation_rad < min_sched_el_rad) {
+                    LOG_DEBUG("CTRL", "Skipping pass NORAD %d: max_el=%.1f° < min=%.1f°",
+                             pass_msg.pass.norad_id,
+                             pass_msg.pass.max_elevation_rad * SGP4_RAD_TO_DEG,
+                             pass_filter_cfg.pass.min_schedule_elevation_deg);
+                    continue;
+                }
+
+                rtems_semaphore_obtain(g_pass_queue_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+                /* Remove any existing pass for this satellite (updated prediction) */
+                pass_queue_remove_by_norad(&g_upcoming_passes, pass_msg.pass.norad_id);
+
+                /* Insert into priority queue */
+                if (pass_queue_insert(&g_upcoming_passes, &pass_msg.pass) == 0) {
+                    LOG_DEBUG("CTRL", "Queued pass: NORAD %d, max_el=%.1f deg",
+                             pass_msg.pass.norad_id,
+                             pass_msg.pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                } else {
+                    LOG_WARN("CTRL", "Pass queue full, dropping NORAD %d",
+                             pass_msg.pass.norad_id);
+                }
+
+                rtems_semaphore_release(g_pass_queue_mutex);
             }
         }
 
@@ -2110,11 +2642,110 @@ rtems_task controller_task(rtems_task_argument arg) {
             }
         }
 
-        // TODO: If a pass is currently active:
-        //       - Calculate current look angles to satellite
-        //       - Acquire g_uart1_mutex
-        //       - Send antenna command via UART1
-        //       - Release g_uart1_mutex
+        // ================================================================
+        // Pass Scheduling Logic
+        // ================================================================
+
+        /* Get current time and configuration */
+        rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+        time_t current_time_t = g_state.current_time;
+        bool have_time = g_state.time_valid;
+        rtems_semaphore_release(g_state_mutex);
+
+        if (have_time) {
+            double current_jd = sgp4_unix_to_jd((double)current_time_t);
+
+            /* Get prep time from config */
+            config_t ctrl_cfg;
+            config_get_copy(&ctrl_cfg);
+            double prep_time_jd = ctrl_cfg.pass.prep_time_sec / 86400.0;
+            double replacement_buffer_jd = (ctrl_cfg.pass.prep_time_sec + 60) / 86400.0;
+
+            /* Lock pass queue mutex for all pass scheduling operations */
+            rtems_semaphore_obtain(g_pass_queue_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+            /* Prune expired passes from queue */
+            int pruned = pass_queue_prune_expired(&g_upcoming_passes, current_jd);
+            if (pruned > 0) {
+                LOG_DEBUG("CTRL", "Pruned %d expired passes", pruned);
+            }
+
+            /* Check if we have a scheduled pass that has ended */
+            if (g_scheduled_pass.active && current_jd > g_scheduled_pass.pass.los_jd) {
+                LOG_INFO("CTRL", "Pass for NORAD %d completed",
+                         g_scheduled_pass.pass.norad_id);
+                g_scheduled_pass.active = false;
+                g_scheduled_pass.prep_sent = false;
+            }
+
+            /* If no pass scheduled, try to schedule one */
+            if (!g_scheduled_pass.active && !pass_queue_is_empty(&g_upcoming_passes)) {
+                pass_info_t next_pass;
+                if (pass_queue_extract(&g_upcoming_passes, &next_pass) == 0) {
+                    g_scheduled_pass.active = true;
+                    g_scheduled_pass.pass = next_pass;
+                    g_scheduled_pass.prep_sent = false;
+
+                    double aos_unix = sgp4_jd_to_unix(next_pass.aos_jd);
+                    struct tm *aos_tm = gmtime((time_t *)&aos_unix);
+                    LOG_INFO("CTRL", "Scheduled pass: NORAD %d at %02d:%02d:%02d, max_el=%.1f deg",
+                             next_pass.norad_id,
+                             aos_tm->tm_hour, aos_tm->tm_min, aos_tm->tm_sec,
+                             next_pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                }
+            }
+
+            /* Dynamic pass replacement: check if a better overlapping pass arrived */
+            if (g_scheduled_pass.active && !g_scheduled_pass.prep_sent) {
+                /* Only consider replacement if more than 6 minutes until pass */
+                double time_until_aos = g_scheduled_pass.pass.aos_jd - current_jd;
+                if (time_until_aos > replacement_buffer_jd) {
+                    /* Check if queue has a higher-priority overlapping pass */
+                    const pass_info_t *candidate = pass_queue_peek(&g_upcoming_passes);
+                    if (candidate != NULL &&
+                        pass_overlaps(candidate, &g_scheduled_pass.pass) &&
+                        candidate->max_elevation_rad > g_scheduled_pass.pass.max_elevation_rad) {
+
+                        LOG_INFO("CTRL", "Replacing NORAD %d (el=%.1f) with NORAD %d (el=%.1f)",
+                                 g_scheduled_pass.pass.norad_id,
+                                 g_scheduled_pass.pass.max_elevation_rad * SGP4_RAD_TO_DEG,
+                                 candidate->norad_id,
+                                 candidate->max_elevation_rad * SGP4_RAD_TO_DEG);
+
+                        /* Extract the better pass and schedule it */
+                        pass_info_t better_pass;
+                        pass_queue_extract(&g_upcoming_passes, &better_pass);
+                        g_scheduled_pass.pass = better_pass;
+                        /* Old pass is discarded (not re-queued since it was replaced) */
+                    }
+                }
+            }
+
+            /* Check if it's time to send prep command to executor */
+            if (g_scheduled_pass.active && !g_scheduled_pass.prep_sent) {
+                double time_until_aos = g_scheduled_pass.pass.aos_jd - current_jd;
+                if (time_until_aos <= prep_time_jd) {
+                    /* Send start command to executor */
+                    executor_command_message_t exec_cmd;
+                    exec_cmd.command = EXEC_CMD_START_PASS;
+                    exec_cmd.pass = g_scheduled_pass.pass;
+
+                    rtems_status_code exec_status = rtems_message_queue_send(
+                        g_executor_cmd_queue, &exec_cmd, sizeof(exec_cmd));
+
+                    if (exec_status == RTEMS_SUCCESSFUL) {
+                        g_scheduled_pass.prep_sent = true;
+                        LOG_INFO("CTRL", "Sent START_PASS to executor for NORAD %d",
+                                 g_scheduled_pass.pass.norad_id);
+                    } else {
+                        LOG_ERROR("CTRL", "Failed to send command to executor: %d",
+                                  exec_status);
+                    }
+                }
+            }
+
+            rtems_semaphore_release(g_pass_queue_mutex);
+        }
 
         // Main control loop at 10 Hz
         rtems_task_wake_after(rtems_clock_get_ticks_per_second() / 10);
@@ -2167,10 +2798,10 @@ static rtems_status_code create_message_queues(void) {
         return status;
     }
 
-    // Pass prediction queue
+    // Pass prediction queue (increased to handle all satellites)
     status = rtems_message_queue_create(
         rtems_build_name('P', 'A', 'S', 'Q'),
-        16,  // multiple passes can be queued
+        PASS_QUEUE_CAPACITY,  // matches priority queue capacity
         sizeof(pass_message_t),
         RTEMS_DEFAULT_ATTRIBUTES,
         &g_pass_queue
@@ -2205,6 +2836,23 @@ static rtems_status_code create_message_queues(void) {
         LOG_ERROR("INIT", "Failed to create controller command queue: %d", status);
         return status;
     }
+
+    // Pass executor command queue (controller -> executor)
+    status = rtems_message_queue_create(
+        rtems_build_name('E', 'X', 'E', 'C'),
+        4,
+        sizeof(executor_command_message_t),
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_executor_cmd_queue
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create executor command queue: %d", status);
+        return status;
+    }
+
+    // Initialize pass priority queue
+    pass_queue_init(&g_upcoming_passes);
+    memset(&g_scheduled_pass, 0, sizeof(g_scheduled_pass));
 
     LOG_INFO("INIT", "Message queues created successfully");
     return RTEMS_SUCCESSFUL;
@@ -2262,6 +2910,19 @@ static rtems_status_code create_semaphores(void) {
     );
     if (status != RTEMS_SUCCESSFUL) {
         LOG_ERROR("INIT", "Failed to create UART3 mutex: %d", status);
+        return status;
+    }
+
+    // Pass queue mutex (for pass scheduling data)
+    status = rtems_semaphore_create(
+        rtems_build_name('P', 'A', 'S', 'Q'),
+        1,
+        RTEMS_BINARY_SEMAPHORE | RTEMS_PRIORITY | RTEMS_INHERIT_PRIORITY,
+        0,
+        &g_pass_queue_mutex
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create pass queue mutex: %d", status);
         return status;
     }
 

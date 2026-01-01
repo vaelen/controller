@@ -149,7 +149,8 @@ typedef enum {
     SECTION_FILES,
     SECTION_SYSTEM,
     SECTION_NETWORK,
-    SECTION_TLE
+    SECTION_TLE,
+    SECTION_PASS
 } config_section_t;
 
 /*
@@ -174,6 +175,9 @@ static config_section_t identify_section(const char *name)
     }
     if (strcasecmp_local(name, "tle") == 0) {
         return SECTION_TLE;
+    }
+    if (strcasecmp_local(name, "pass") == 0) {
+        return SECTION_PASS;
     }
     return SECTION_NONE;
 }
@@ -360,6 +364,50 @@ static void process_tle_key(config_t *cfg, const char *key, const char *value)
     }
 }
 
+/*
+ * Process a key=value pair for the [pass] section.
+ */
+static void process_pass_key(config_t *cfg, const char *key, const char *value)
+{
+    if (strcasecmp_local(key, "prediction_window") == 0) {
+        cfg->pass.prediction_window_min = atoi(value);
+        if (cfg->pass.prediction_window_min < 10) {
+            cfg->pass.prediction_window_min = 10;
+        }
+    } else if (strcasecmp_local(key, "min_elevation") == 0) {
+        cfg->pass.min_elevation_deg = atof(value);
+        if (cfg->pass.min_elevation_deg < 0.0) {
+            cfg->pass.min_elevation_deg = 0.0;
+        } else if (cfg->pass.min_elevation_deg > 90.0) {
+            cfg->pass.min_elevation_deg = 90.0;
+        }
+    } else if (strcasecmp_local(key, "min_schedule_elevation") == 0) {
+        cfg->pass.min_schedule_elevation_deg = atof(value);
+        if (cfg->pass.min_schedule_elevation_deg < 0.0) {
+            cfg->pass.min_schedule_elevation_deg = 0.0;
+        } else if (cfg->pass.min_schedule_elevation_deg > 90.0) {
+            cfg->pass.min_schedule_elevation_deg = 90.0;
+        }
+    } else if (strcasecmp_local(key, "prep_time") == 0) {
+        cfg->pass.prep_time_sec = atoi(value);
+        if (cfg->pass.prep_time_sec < 0) {
+            cfg->pass.prep_time_sec = 0;
+        }
+    } else if (strcasecmp_local(key, "calc_interval") == 0) {
+        cfg->pass.calc_interval_sec = atoi(value);
+        if (cfg->pass.calc_interval_sec < 60) {
+            cfg->pass.calc_interval_sec = 60;
+        }
+    } else if (strcasecmp_local(key, "status_display_count") == 0) {
+        cfg->pass.status_display_count = atoi(value);
+        if (cfg->pass.status_display_count < 1) {
+            cfg->pass.status_display_count = 1;
+        } else if (cfg->pass.status_display_count > 20) {
+            cfg->pass.status_display_count = 20;
+        }
+    }
+}
+
 // ============================================================================
 // Public Functions
 // ============================================================================
@@ -405,6 +453,14 @@ void config_init_defaults(config_t *cfg)
     cfg->satellite_count = 0;
     memset(cfg->satellite_norad_ids, 0, sizeof(cfg->satellite_norad_ids));
     cfg->tle_update_interval_hours = 6;
+
+    /* Pass prediction defaults */
+    cfg->pass.prediction_window_min = 60;
+    cfg->pass.min_elevation_deg = 5.0;
+    cfg->pass.min_schedule_elevation_deg = 15.0;
+    cfg->pass.prep_time_sec = 300;
+    cfg->pass.calc_interval_sec = 300;
+    cfg->pass.status_display_count = 5;
 
     /* System settings */
     cfg->log_level = LOG_LEVEL_INFO;
@@ -503,6 +559,9 @@ config_error_t config_load(config_t *cfg, const char *path)
             case SECTION_TLE:
                 process_tle_key(cfg, key, value);
                 break;
+            case SECTION_PASS:
+                process_pass_key(cfg, key, value);
+                break;
             default:
                 LOG_DEBUG("CONFIG", "Line %d: Key '%s' outside section",
                           line_num, key);
@@ -595,7 +654,16 @@ config_error_t config_save(const config_t *cfg, const char *path)
     fprintf(f, "[tle]\n");
     fprintf(f, "url = %s\n", cfg->tle_url);
     fprintf(f, "satellites = %s\n", cfg->satellites_str);
-    fprintf(f, "update_interval = %d\n", cfg->tle_update_interval_hours);
+    fprintf(f, "update_interval = %d\n\n", cfg->tle_update_interval_hours);
+
+    /* [pass] section */
+    fprintf(f, "[pass]\n");
+    fprintf(f, "prediction_window = %d\n", cfg->pass.prediction_window_min);
+    fprintf(f, "min_elevation = %.1f\n", cfg->pass.min_elevation_deg);
+    fprintf(f, "min_schedule_elevation = %.1f\n", cfg->pass.min_schedule_elevation_deg);
+    fprintf(f, "prep_time = %d\n", cfg->pass.prep_time_sec);
+    fprintf(f, "calc_interval = %d\n", cfg->pass.calc_interval_sec);
+    fprintf(f, "status_display_count = %d\n", cfg->pass.status_display_count);
 
     fclose(f);
 
