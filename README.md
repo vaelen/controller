@@ -349,7 +349,7 @@ The following table shows the physical P9 header pins used for each UART:
 
 ## Configuration
 
-The controller reads configuration from an INI-style file on the SD card. If no configuration file exists, a default one is created automatically on first boot.
+The controller reads configuration from an INI-style file on the SD card. If no configuration file exists, defaults are used.
 
 ### Configuration File Location
 
@@ -413,6 +413,8 @@ tracking_poll_ms = 100
 rotator_threshold = 1.0
 doppler_threshold = 1.0
 preposition_margin = 30
+max_tle_age = 3.0
+max_pass_duration = 20.0
 ```
 
 ### Configuration Sections
@@ -496,6 +498,8 @@ Default URL: `https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=t
 | `rotator_threshold`      | Minimum position change to command rotator (degrees) | `1.0`   |
 | `doppler_threshold`      | Minimum Doppler change to update radio (kHz)         | `1.0`   |
 | `preposition_margin`     | Time before AOS to complete prepositioning (seconds) | `30`    |
+| `max_tle_age`            | Maximum TLE age before skipping satellite (days)     | `3.0`   |
+| `max_pass_duration`      | Maximum pass duration before warning (minutes)       | `20.0`  |
 
 ### Notes
 
@@ -510,8 +514,7 @@ Default URL: `https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=t
 The SD card must be formatted with a FAT filesystem (FAT16 or FAT32). The controller automatically:
 
 1. Mounts the SD card at `/mnt/sd`
-2. Loads `config.ini` if present
-3. Creates a default `config.ini` if none exists
+2. Loads `config.ini` if present (uses defaults if not found)
 
 See [sdcard.md](sdcard.md) for technical details on SD card support.
 
