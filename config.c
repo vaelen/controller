@@ -433,6 +433,20 @@ static void process_pass_key(config_t *cfg, const char *key, const char *value)
         } else if (cfg->pass.preposition_margin_sec > 120) {
             cfg->pass.preposition_margin_sec = 120;
         }
+    } else if (strcasecmp_local(key, "max_tle_age") == 0) {
+        cfg->pass.max_tle_age_days = atof(value);
+        if (cfg->pass.max_tle_age_days < 0.5) {
+            cfg->pass.max_tle_age_days = 0.5;
+        } else if (cfg->pass.max_tle_age_days > 30.0) {
+            cfg->pass.max_tle_age_days = 30.0;
+        }
+    } else if (strcasecmp_local(key, "max_pass_duration") == 0) {
+        cfg->pass.max_pass_duration_min = atof(value);
+        if (cfg->pass.max_pass_duration_min < 5.0) {
+            cfg->pass.max_pass_duration_min = 5.0;
+        } else if (cfg->pass.max_pass_duration_min > 120.0) {
+            cfg->pass.max_pass_duration_min = 120.0;
+        }
     }
 }
 
@@ -495,6 +509,10 @@ void config_init_defaults(config_t *cfg)
     cfg->pass.rotator_threshold_deg = 1.0;
     cfg->pass.doppler_threshold_khz = 1.0;
     cfg->pass.preposition_margin_sec = 30;
+
+    /* TLE validation defaults */
+    cfg->pass.max_tle_age_days = 3.0;
+    cfg->pass.max_pass_duration_min = 20.0;
 
     /* System settings */
     cfg->log_level = LOG_LEVEL_INFO;
@@ -662,10 +680,12 @@ config_error_t config_save(const config_t *cfg, const char *path)
     switch (cfg->log_level) {
         case LOG_LEVEL_DEBUG: level_str = "DEBUG"; break;
         case LOG_LEVEL_INFO:  level_str = "INFO";  break;
-        case LOG_LEVEL_WARN:  level_str = "WARN";  break;
+ 
+       case LOG_LEVEL_WARN:  level_str = "WARN";  break;
         case LOG_LEVEL_ERROR: level_str = "ERROR"; break;
     }
-    fprintf(f, "log_level = %s\n", level_str);
+ 
+   fprintf(f, "log_level = %s\n", level_str);
     fprintf(f, "status_interval = %d\n\n", cfg->status_interval_sec);
 
     /* [network] section */
@@ -702,6 +722,8 @@ config_error_t config_save(const config_t *cfg, const char *path)
     fprintf(f, "rotator_threshold = %.1f\n", cfg->pass.rotator_threshold_deg);
     fprintf(f, "doppler_threshold = %.1f\n", cfg->pass.doppler_threshold_khz);
     fprintf(f, "preposition_margin = %d\n", cfg->pass.preposition_margin_sec);
+    fprintf(f, "max_tle_age = %.1f\n", cfg->pass.max_tle_age_days);
+    fprintf(f, "max_pass_duration = %.1f\n", cfg->pass.max_pass_duration_min);
 
     fclose(f);
 
@@ -733,16 +755,6 @@ rtems_status_code config_system_init(const char *path)
     config_error_t err = config_load(&g_config, path);
     if (err == CONFIG_ERROR_FILE_OPEN) {
         LOG_WARN("CONFIG", "Config file not found, using defaults");
-        /* Save default configuration to SD card for future editing */
-        const char *save_path = path ? path : CONFIG_DEFAULT_PATH;
-        config_error_t save_err = config_save(&g_config, save_path);
-        if (save_err == CONFIG_SUCCESS) {
-            LOG_INFO("CONFIG", "Default configuration saved to %s", save_path);
-            strncpy(g_config.source_path, save_path, CONFIG_PATH_MAX - 1);
-            g_config.source_path[CONFIG_PATH_MAX - 1] = '\0';
-        } else {
-            LOG_WARN("CONFIG", "Could not save default config: %d", save_err);
-        }
     } else if (err != CONFIG_SUCCESS) {
         LOG_WARN("CONFIG", "Config load error %d, using defaults", err);
     }

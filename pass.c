@@ -703,7 +703,7 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
     LOG_INFO("PASS", "Calculator task started");
 
     /* Wait for initial GPS fix and TLE load */
-    rtems_task_wake_after(10 * rtems_clock_get_ticks_per_second());
+    rtems_task_wake_after(30 * rtems_clock_get_ticks_per_second());
 
     while (true) {
         /* Get configuration */
@@ -724,7 +724,7 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
 
         if (!location_valid || !time_valid) {
             LOG_DEBUG("PASS", "Waiting for GPS fix...");
-            rtems_task_wake_after(10 * rtems_clock_get_ticks_per_second());
+            rtems_task_wake_after(30 * rtems_clock_get_ticks_per_second());
             continue;
         }
 
@@ -732,14 +732,79 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
         double start_jd = sgp4_unix_to_jd((double)current_time);
         double end_jd = start_jd + (prediction_window_min + PASS_WINDOW_BUFFER_MIN) / 1440.0;
 
+        /* Log calculation parameters */
+        if (log_get_level() <= LOG_LEVEL_DEBUG) {
+            struct tm *start_tm = gmtime(&current_time);
+            double end_unix = sgp4_jd_to_unix(end_jd);
+            time_t end_time = (time_t)end_unix;
+            struct tm end_tm_copy;
+            struct tm *end_tm = gmtime(&end_time);
+            if (end_tm) end_tm_copy = *end_tm;
+
+            LOG_DEBUG("PASS", "=== Pass Calculation ===");
+            LOG_DEBUG("PASS", "Observer: %.4f deg N, %.4f deg E, %.0f m",
+                      observer.lat_rad * SGP4_RAD_TO_DEG,
+                      observer.lon_rad * SGP4_RAD_TO_DEG,
+                      observer.alt_km * 1000.0);
+            LOG_DEBUG("PASS", "Time: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                      start_tm->tm_year + 1900, start_tm->tm_mon + 1, start_tm->tm_mday,
+                      start_tm->tm_hour, start_tm->tm_min, start_tm->tm_sec);
+            LOG_DEBUG("PASS", "Window: %04d-%02d-%02d %02d:%02d:%02d to %04d-%02d-%02d %02d:%02d:%02d",
+                      start_tm->tm_year + 1900, start_tm->tm_mon + 1, start_tm->tm_mday,
+                      start_tm->tm_hour, start_tm->tm_min, start_tm->tm_sec,
+                      end_tm_copy.tm_year + 1900, end_tm_copy.tm_mon + 1, end_tm_copy.tm_mday,
+                      end_tm_copy.tm_hour, end_tm_copy.tm_min, end_tm_copy.tm_sec);
+            LOG_DEBUG("PASS", "Min elevation: %.1f deg", cfg.pass.min_elevation_deg);
+        }
+
         int passes_found = 0;
 
         /* Iterate over all satellites */
         rtems_semaphore_obtain(g_tle_database_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
         int sat_count = g_state.satellite_count;
+        int valid_sats = 0;
+
+        /* Check to see if the TLE is too old before starting */
+        for (int i = 0; i < sat_count && i < MAX_SATELLITES; i++) {
+            if (!g_state.satellites[i].valid) {
+                continue;
+            }
+
+            /* Calculate TLE age for this satellite */
+            double tle_epoch_jd = g_state.satellites[i].state.jdsatepoch +
+                                    g_state.satellites[i].state.jdsatepochF;
+            double tle_age_days = start_jd - tle_epoch_jd;
+
+            /* Skip satellite if TLE is too old */
+            if (tle_age_days > cfg.pass.max_tle_age_days) {
+                continue;
+            }
+
+            valid_sats++;
+        }
+
+        if (valid_sats == 0) {
+            LOG_WARN("PASS", "Waiting for updated TLE data...");
+            rtems_semaphore_release(g_tle_database_mutex);
+            rtems_task_wake_after(30 * rtems_clock_get_ticks_per_second());
+            continue;
+        }
 
         for (int i = 0; i < sat_count && i < MAX_SATELLITES; i++) {
             if (!g_state.satellites[i].valid) {
+                continue;
+            }
+
+            /* Calculate TLE age for this satellite */
+            double tle_epoch_jd = g_state.satellites[i].state.jdsatepoch +
+                                    g_state.satellites[i].state.jdsatepochF;
+            double tle_age_days = start_jd - tle_epoch_jd;
+
+            /* Skip satellite if TLE is too old */
+            if (tle_age_days > cfg.pass.max_tle_age_days) {
+                LOG_ERROR("PASS", "TLE for NORAD %d is %.1f days old (max: %.1f) - skipping",
+                            g_state.satellites[i].tle.norad_id, tle_age_days,
+                            cfg.pass.max_tle_age_days);
                 continue;
             }
 
@@ -751,6 +816,40 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
                                min_el_rad,
                                &pass)) {
 
+                passes_found++;
+
+                /* Log pass with full date/time and duration */
+                double aos_unix = sgp4_jd_to_unix(pass.aos_jd);
+                double los_unix = sgp4_jd_to_unix(pass.los_jd);
+                double duration_min = (los_unix - aos_unix) / 60.0;
+
+                if (duration_min > cfg.pass.max_pass_duration_min) {
+                    LOG_WARN("PASS", "Pass duration %.1f min for NORAD %d exceeds max %.1f min (TLE age: %.1f days)",
+                             duration_min, pass.norad_id, cfg.pass.max_pass_duration_min, tle_age_days);
+                }
+
+                if (log_get_level() <= LOG_LEVEL_DEBUG) {
+                    time_t aos_time = (time_t)aos_unix;
+                    time_t los_time = (time_t)los_unix;
+                    struct tm aos_tm_copy, los_tm_copy;
+                    struct tm *aos_tm = gmtime(&aos_time);
+                    if (aos_tm) aos_tm_copy = *aos_tm;
+                    struct tm *los_tm = gmtime(&los_time);
+                    if (los_tm) los_tm_copy = *los_tm;
+
+                    const char *sat_name = find_satellite_name(pass.norad_id);
+                    LOG_DEBUG("PASS", "Found: %s (NORAD %d), TLE age: %.1f days",
+                              sat_name ? sat_name : "Unknown", pass.norad_id, tle_age_days);
+                    LOG_DEBUG("PASS", "  AOS: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                              aos_tm_copy.tm_year + 1900, aos_tm_copy.tm_mon + 1, aos_tm_copy.tm_mday,
+                              aos_tm_copy.tm_hour, aos_tm_copy.tm_min, aos_tm_copy.tm_sec);
+                    LOG_DEBUG("PASS", "  LOS: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                              los_tm_copy.tm_year + 1900, los_tm_copy.tm_mon + 1, los_tm_copy.tm_mday,
+                              los_tm_copy.tm_hour, los_tm_copy.tm_min, los_tm_copy.tm_sec);
+                    LOG_DEBUG("PASS", "  Duration: %.1f min, MaxEl: %.1f deg",
+                              duration_min, pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                }
+
                 /* Send pass to controller */
                 pass_message_t msg;
                 msg.type = MSG_PASS_CALCULATED;
@@ -760,13 +859,13 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
                     g_pass_queue, &msg, sizeof(msg));
 
                 if (status == RTEMS_SUCCESSFUL) {
-                    passes_found++;
-                    LOG_DEBUG("PASS", "Found pass: NORAD %d, max_el=%.1f deg",
-                              pass.norad_id,
-                              pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                    LOG_DEBUG("PASS", "Pass for NORAD %d queued successfully", pass.norad_id);
                 } else if (status == RTEMS_TOO_MANY) {
                     LOG_WARN("PASS", "Pass queue full, dropping pass for NORAD %d",
                              pass.norad_id);
+                } else {
+                    LOG_ERROR("PASS", "Failed to queue pass for NORAD %d: %s",
+                              pass.norad_id, rtems_status_text(status));
                 }
             }
         }
@@ -774,7 +873,7 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
         rtems_semaphore_release(g_tle_database_mutex);
 
         if (passes_found > 0) {
-            LOG_INFO("PASS", "Found %d passes in next %d minutes",
+            LOG_INFO("PASS", "Found %d passes in the next %d minutes",
                      passes_found, prediction_window_min);
         }
 
@@ -822,8 +921,8 @@ static void process_completing(void);
  */
 static void handle_start_pass(const pass_info_t *pass) {
     /* Log pass details */
-    double aos_unix = sgp4_jd_to_unix(pass->aos_jd);
-    struct tm *aos_tm = gmtime((time_t *)&aos_unix);
+    time_t aos_time = (time_t)sgp4_jd_to_unix(pass->aos_jd);
+    struct tm *aos_tm = gmtime(&aos_time);
 
     LOG_INFO("EXEC", "Starting pass for NORAD %d", pass->norad_id);
     LOG_INFO("EXEC", "  AOS: %02d:%02d:%02d, az=%.1f deg",

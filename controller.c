@@ -63,6 +63,7 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <rtems/dhcpcd.h>
+#include <resolv.h>
 
 // ============================================================================
 // Global Variable Definitions (exported via shared.h)
@@ -469,6 +470,31 @@ static void network_configure_ipv6_static(const network_config_t *cfg)
 }
 
 /*
+ * Add fallback DNS servers to the resolver.
+ * Called after DHCP completes to ensure DNS works even if DHCP
+ * doesn't provide DNS servers or if the provided servers are unreachable.
+ */
+static void network_add_fallback_dns(void)
+{
+    LOG_INFO("NET", "Adding fallback DNS servers");
+
+    /* Append fallback nameservers to resolv.conf */
+    FILE *f = fopen("/etc/resolv.conf", "a");
+    if (f) {
+        fprintf(f, "nameserver 1.1.1.1\n");
+        fprintf(f, "nameserver 8.8.8.8\n");
+        fclose(f);
+
+        /* Re-initialize resolver to pick up changes */
+        res_init();
+
+        LOG_INFO("NET", "Added fallback DNS: 1.1.1.1, 8.8.8.8");
+    } else {
+        LOG_WARN("NET", "Could not open /etc/resolv.conf to add fallback DNS");
+    }
+}
+
+/*
  * Start dhcpcd daemon for DHCP/SLAAC configuration.
  */
 static void network_start_dhcpcd(const network_config_t *cfg)
@@ -499,6 +525,9 @@ static void network_start_dhcpcd(const network_config_t *cfg)
 
     /* dhcpcd runs in background, wait briefly for it to get an address */
     rtems_task_wake_after(3 * rtems_clock_get_ticks_per_second());
+
+    /* Add fallback DNS servers in case DHCP doesn't provide them */
+    network_add_fallback_dns();
 }
 
 /*
@@ -742,16 +771,19 @@ rtems_task status_task(rtems_task_argument arg) {
                     }
 
                     /* Convert times to HH:MM:SS */
-                    double aos_unix = sgp4_jd_to_unix(p->aos_jd);
-                    double los_unix = sgp4_jd_to_unix(p->los_jd);
-                    struct tm *aos_tm = gmtime((time_t *)&aos_unix);
-                    int aos_h = aos_tm->tm_hour;
-                    int aos_m = aos_tm->tm_min;
-                    int aos_s = aos_tm->tm_sec;
-                    struct tm *los_tm = gmtime((time_t *)&los_unix);
-                    int los_h = los_tm->tm_hour;
-                    int los_m = los_tm->tm_min;
-                    int los_s = los_tm->tm_sec;
+                    time_t aos_time = (time_t)sgp4_jd_to_unix(p->aos_jd);
+                    time_t los_time = (time_t)sgp4_jd_to_unix(p->los_jd);
+                    struct tm aos_tm_copy, los_tm_copy;
+                    struct tm *aos_tm = gmtime(&aos_time);
+                    if (aos_tm) aos_tm_copy = *aos_tm;
+                    struct tm *los_tm = gmtime(&los_time);
+                    if (los_tm) los_tm_copy = *los_tm;
+                    int aos_h = aos_tm_copy.tm_hour;
+                    int aos_m = aos_tm_copy.tm_min;
+                    int aos_s = aos_tm_copy.tm_sec;
+                    int los_h = los_tm_copy.tm_hour;
+                    int los_m = los_tm_copy.tm_min;
+                    int los_s = los_tm_copy.tm_sec;
 
                     LOG_INFO("STATUS", "  %-20s %5d  %02d:%02d:%02d  %02d:%02d:%02d  %5.1f°  %5.1f°  %5.1f°",
                              name_buf,
@@ -1062,8 +1094,8 @@ rtems_task controller_task(rtems_task_argument arg) {
                     g_scheduled_pass.pass = next_pass;
                     g_scheduled_pass.prep_sent = false;
 
-                    double aos_unix = sgp4_jd_to_unix(next_pass.aos_jd);
-                    struct tm *aos_tm = gmtime((time_t *)&aos_unix);
+                    time_t aos_time = (time_t)sgp4_jd_to_unix(next_pass.aos_jd);
+                    struct tm *aos_tm = gmtime(&aos_time);
                     LOG_INFO("CTRL", "Scheduled pass: NORAD %d at %02d:%02d:%02d, max_el=%.1f deg",
                              next_pass.norad_id,
                              aos_tm->tm_hour, aos_tm->tm_min, aos_tm->tm_sec,

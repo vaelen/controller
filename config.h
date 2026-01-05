@@ -121,6 +121,10 @@ typedef struct pass_config {
     double rotator_threshold_deg;  /* Min change to command rotator (default: 1.0) */
     double doppler_threshold_khz;  /* Min change to update radio freq (default: 1.0) */
     int preposition_margin_sec;    /* Time before AOS to finish preposition (default: 30) */
+
+    /* TLE validation */
+    double max_tle_age_days;       /* Max TLE age before skipping satellite (default: 3.0) */
+    double max_pass_duration_min;  /* Max pass duration before warning (default: 20.0) */
 } pass_config_t;
 
 /*

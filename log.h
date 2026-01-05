@@ -72,6 +72,13 @@ bool log_clock_is_valid(void);
 void log_set_level(log_level_t level);
 
 /*
+ * Get the current minimum log level.
+ *
+ * @return Current minimum log level
+ */
+log_level_t log_get_level(void);
+
+/*
  * Log a formatted message to the console.
  *
  * Uses a semaphore to protect printf from concurrent access.

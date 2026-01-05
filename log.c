@@ -76,6 +76,10 @@ void log_set_level(log_level_t level) {
     g_log_level = level;
 }
 
+log_level_t log_get_level(void) {
+    return g_log_level;
+}
+
 void log_write(log_level_t level, const char *tag, const char *fmt, ...) {
     /* Early exit if below threshold */
     if (level < g_log_level) {
