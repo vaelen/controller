@@ -1,8 +1,10 @@
 # Satellite Groundstation Controller
 
-An RTEMS-based satellite groundstation controller that coordinates GPS positioning, TLE database management, pass prediction, and antenna control for automated satellite tracking.
+An [RTEMS-based](https://www.rtems.org/) satellite groundstation controller that coordinates GPS positioning, TLE database management, pass prediction, radio control, and antenna control for automated satellite tracking.
 
 It is meant to run on a BeagleBone Black SBC with the assistance of an [I/O cape that I created](https://github.com/vaelen/bbb-io-cape), but the cape is entirely optional.
+
+I've also created [firmware](https://github.com/vaelen/serial-device-emulator) that you can run on a Pi Pico, STM32, ESP32, or similar device to simulate a GPS, a radio, or a rotator. This way you can test the functionality of the controller if you do not have the rest of the necessary hardware.
 
 ## Overview
 
