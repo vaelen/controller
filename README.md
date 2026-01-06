@@ -310,41 +310,27 @@ The following table shows the physical P9 header pins used for each UART:
 ## Example Log Output
 
 ```txt
-*** GROUNDSTATION CONTROLLER ***
-[??:??:??] INFO  [LOG    ] Logging initialized
-[??:??:??] INFO  [INIT   ] Semaphores created successfully
-[??:??:??] INFO  [INIT   ] Message queues created successfully
-[??:??:??] INFO  [INIT   ] Tasks created successfully
-[??:??:??] INFO  [INIT   ] All tasks started successfully
-[??:??:??] INFO  [EXEC   ] Pass executor task started
-[??:??:??] INFO  [ROTCMD ] Rotator command task started
-[??:??:??] INFO  [CTRL   ] Controller task started
-[??:??:??] INFO  [ROTATOR] Status task started
-[??:??:??] INFO  [RADIO  ] Status task started
-[??:??:??] INFO  [ANTENNA] Location task started
-[??:??:??] INFO  [GPS    ] Task started
-[??:??:??] INFO  [PASS   ] Calculator task started
-[??:??:??] INFO  [TLE    ] Updater task started
-[??:??:??] INFO  [STATUS ] Status task started
-[09:29:42] INFO  [CTRL   ] GPS: lat=35.5872 lon=139.4901 alt=0.05 km
-[09:29:42] INFO  [CTRL   ] GPS Time: 2025-12-18 09:29:42 UTC
-[09:30:11] INFO  [STATUS ] === System Status ===
-[09:30:11] INFO  [STATUS ] GPS Time: 2025-12-18 09:30:11 UTC
-[09:30:11] INFO  [STATUS ] GPS Pos: 35.5872, 139.4901, 52m
-[09:30:11] INFO  [STATUS ] Antenna: az=0.0 el=0.0 deg
-[09:30:11] INFO  [STATUS ] Radio: VFO-A active, mode=USB, preamp=IPO
-[09:30:11] INFO  [STATUS ] TLE: 12 satellites loaded
-[09:30:11] INFO  [STATUS ] Passes: 3 upcoming
-[09:30:11] INFO  [STATUS ]   Satellite             NORAD       AOS       LOS  AOS Az  LOS Az   MaxEl
-[09:30:11] INFO  [STATUS ]   ISS (ZARYA)           25544  09:45:12  09:56:34   225.3°   45.2°   67.8°
-[09:35:00] INFO  [EXEC   ] Starting pass for NORAD 25544
-[09:35:00] INFO  [EXEC   ]   AOS: 09:45:12, az=225.3 deg
-[09:35:00] INFO  [EXEC   ]   Max elevation: 67.8 deg
-[09:35:00] INFO  [EXEC   ] Prepositioning antenna to az=225.3 el=0.0
-[09:44:42] INFO  [EXEC   ] Preposition complete, waiting for AOS (30 sec)
-[09:45:12] INFO  [EXEC   ] AOS - Beginning tracking of ISS (ZARYA)
-[09:56:34] INFO  [EXEC   ] LOS - Pass complete for ISS (ZARYA)
-[09:56:34] INFO  [EXEC   ] Pass completed, returning to idle
+[16:53:09] INFO  [STATUS ] === System Status ===
+[16:53:09] INFO  [STATUS ] GPS Time: 2026-01-06 16:53:09 UTC
+[16:53:09] INFO  [STATUS ] GPS Pos: 35.5871, 139.4900, 55m
+[16:53:09] INFO  [STATUS ] Antenna: az=345.0 el=9.0 deg
+[16:53:09] INFO  [STATUS ] Radio: VFO-A active, mode=???, preamp=IPO
+[16:53:09] INFO  [STATUS ] Radio: VFO-A=14.074000 MHz, VFO-B=7.074000 MHz
+[16:53:09] INFO  [STATUS ] TLE: 12 satellites loaded
+[16:53:09] INFO  [STATUS ] Passes: 4 upcoming
+[16:53:09] INFO  [STATUS ]   Satellite            NORAD       AOS       LOS  AOS Az  LOS Az   MaxEl
+[16:53:09] INFO  [STATUS ]   -------------------- -----  --------  --------  ------  ------  ------
+[16:53:09] INFO  [STATUS ]   CUBEBUG-2 (LO-74)    39440  17:01:27  17:11:25    9.4°  197.5°   76.6°
+[16:53:09] INFO  [STATUS ]     Down:437.445 FSK
+[16:53:09] INFO  [STATUS ]   ISS (ZARYA)          25544  17:06:01  17:12:57  333.9°   82.3°   16.2°
+[16:53:09] INFO  [STATUS ]     Down:145.825 AFSK, Up:145.825 AFSK
+[16:53:09] INFO  [STATUS ]   FUNCUBE-1 (AO-73)    39444  17:23:24  17:31:34   38.7°  151.7°   18.8°
+[16:53:09] INFO  [STATUS ]     Down:145.935 ???
+[16:53:09] INFO  [STATUS ]   UWE-3                39446  17:44:48  17:54:15    1.9°  209.6°   45.2°
+[16:53:09] INFO  [STATUS ]     Down:436.395 FSK
+[16:53:09] INFO  [STATUS ] Network: cpsw0
+[16:53:09] INFO  [STATUS ]   IPv4: 192.168.68.17
+[16:53:09] INFO  [STATUS ] =====================
 ```
 
 ## Configuration
