@@ -17,8 +17,8 @@
 #include <time.h>
 
 #include "sgp4.h"
-#include "priority_queue.h"
 #include "config.h"
+#include "priority_queue.h"
 
 // ============================================================================
 // Configuration Constants
@@ -44,25 +44,7 @@ typedef enum message_type {
     MSG_CONFIG_RELOAD
 } message_type_t;
 
-// Radio operating mode enum (Yaesu FT-991A CAT protocol)
-typedef enum radio_mode {
-    RADIO_MODE_LSB      = 0x1,
-    RADIO_MODE_USB      = 0x2,
-    RADIO_MODE_CW       = 0x3,
-    RADIO_MODE_FM       = 0x4,
-    RADIO_MODE_AM       = 0x5,
-    RADIO_MODE_RTTY_LSB = 0x6,
-    RADIO_MODE_CW_R     = 0x7,
-    RADIO_MODE_DATA_LSB = 0x8,
-    RADIO_MODE_RTTY_USB = 0x9,
-    RADIO_MODE_DATA_FM  = 0xA,
-    RADIO_MODE_FM_N     = 0xB,
-    RADIO_MODE_DATA_USB = 0xC,
-    RADIO_MODE_AM_N     = 0xD,
-    RADIO_MODE_C4FM     = 0xE
-} radio_mode_t;
-
-// Radio pre-amp setting
+// Radio pre-amp setting (radio_mode_t is now defined in config.h)
 typedef enum radio_preamp {
     RADIO_PREAMP_IPO  = 0,
     RADIO_PREAMP_AMP1 = 1,
@@ -175,6 +157,25 @@ typedef struct rotator_command_message {
 } rotator_command_message_t;
 
 // ============================================================================
+// Radio Command Types
+// ============================================================================
+
+// Commands sent from pass executor to radio command task
+typedef enum radio_command_type {
+    RADIO_CMD_SET_FREQ_A,      // Set VFO-A frequency
+    RADIO_CMD_SET_FREQ_B,      // Set VFO-B frequency
+    RADIO_CMD_SET_MODE_A,      // Set VFO-A mode
+    RADIO_CMD_SET_MODE_B       // Set VFO-B mode
+} radio_command_type_t;
+
+// Message from pass executor to radio command task
+typedef struct radio_command_message {
+    radio_command_type_t command;
+    uint64_t frequency_hz;     // For frequency commands
+    radio_mode_t mode;         // For mode commands
+} radio_command_message_t;
+
+// ============================================================================
 // Pass Executor State
 // ============================================================================
 
@@ -216,6 +217,17 @@ typedef struct executor_tracking_state {
 
     // Velocity components for doppler calculation (km/s)
     double range_rate_km_s;        // Radial velocity toward/away from observer
+
+    // Channel configuration for current pass
+    bool has_downlink;             // Has downlink channel (satellite TX, ground RX)
+    bool has_uplink;               // Has uplink channel (ground TX, satellite RX)
+    satellite_channel_t downlink_channel;
+    satellite_channel_t uplink_channel;
+
+    // Radio frequency tracking state
+    uint64_t last_downlink_freq_hz;  // Last commanded downlink frequency
+    uint64_t last_uplink_freq_hz;    // Last commanded uplink frequency
+    bool radio_initialized;          // True if radio mode/freq set at pass start
 } executor_tracking_state_t;
 
 // ============================================================================
@@ -280,6 +292,7 @@ typedef struct controller_state {
 #define PRIORITY_PASS_EXECUTOR  10
 #define PRIORITY_CONTROLLER     20
 #define PRIORITY_ROTATOR_CMD    25
+#define PRIORITY_RADIO_CMD      26
 #define PRIORITY_ROTATOR_STATUS 30
 #define PRIORITY_RADIO_STATUS   35
 #define PRIORITY_RADIO_FREQ     36
@@ -305,6 +318,7 @@ extern rtems_id g_radio_queue;
 extern rtems_id g_ctrl_cmd_queue;
 extern rtems_id g_executor_cmd_queue;
 extern rtems_id g_rotator_cmd_queue;
+extern rtems_id g_radio_cmd_queue;
 
 // Semaphores (mutexes)
 extern rtems_id g_uart1_mutex;

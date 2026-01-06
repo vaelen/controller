@@ -176,3 +176,155 @@ const char *radio_preamp_to_string(radio_preamp_t preamp) {
         default:                return "???";
     }
 }
+
+const char *signal_mode_to_string(signal_mode_t mode) {
+    switch (mode) {
+        case SIGNAL_MODE_CW:      return "CW";
+        case SIGNAL_MODE_USB:     return "USB";
+        case SIGNAL_MODE_LSB:     return "LSB";
+        case SIGNAL_MODE_AM:      return "AM";
+        case SIGNAL_MODE_FM:      return "FM";
+        case SIGNAL_MODE_RTTY:    return "RTTY";
+        case SIGNAL_MODE_FT8:     return "FT8";
+        case SIGNAL_MODE_FSK:     return "FSK";
+        case SIGNAL_MODE_AFSK:    return "AFSK";
+        case SIGNAL_MODE_GFSK:    return "GFSK";
+        case SIGNAL_MODE_GMSK:    return "GMSK";
+        case SIGNAL_MODE_OQPSK:   return "OQPSK";
+        case SIGNAL_MODE_UNKNOWN: return "???";
+        default:                  return "???";
+    }
+}
+
+const char *encoding_to_string(encoding_type_t encoding) {
+    switch (encoding) {
+        case ENCODING_CW:      return "CW";
+        case ENCODING_VOICE:   return "VOICE";
+        case ENCODING_FT8:     return "FT8";
+        case ENCODING_RTTY:    return "RTTY";
+        case ENCODING_AX25:    return "AX.25";
+        case ENCODING_CCSDS:   return "CCSDS";
+        case ENCODING_UNKNOWN: return "???";
+        default:               return "???";
+    }
+}
+
+radio_mode_t signal_mode_to_radio_mode(const config_t *cfg, signal_mode_t signal_mode) {
+    if (cfg == NULL) {
+        // Default fallback mappings
+        switch (signal_mode) {
+            case SIGNAL_MODE_CW:    return RADIO_MODE_CW;
+            case SIGNAL_MODE_USB:   return RADIO_MODE_USB;
+            case SIGNAL_MODE_LSB:   return RADIO_MODE_LSB;
+            case SIGNAL_MODE_AM:    return RADIO_MODE_AM;
+            case SIGNAL_MODE_FM:    return RADIO_MODE_FM;
+            case SIGNAL_MODE_RTTY:  return RADIO_MODE_RTTY_LSB;
+            case SIGNAL_MODE_FT8:   return RADIO_MODE_DATA_USB;
+            case SIGNAL_MODE_FSK:   return RADIO_MODE_DATA_FM;
+            case SIGNAL_MODE_AFSK:  return RADIO_MODE_DATA_FM;
+            case SIGNAL_MODE_GFSK:  return RADIO_MODE_DATA_FM;
+            case SIGNAL_MODE_GMSK:  return RADIO_MODE_DATA_FM;
+            case SIGNAL_MODE_OQPSK: return RADIO_MODE_DATA_FM;
+            default:                return RADIO_MODE_USB;
+        }
+    }
+
+    // Look up in configuration mode mappings
+    for (int i = 0; i < cfg->mode_mapping_count; i++) {
+        if (cfg->mode_mappings[i].signal_mode == signal_mode) {
+            return cfg->mode_mappings[i].radio_mode;
+        }
+    }
+
+    // Fallback to defaults if not found in config
+    return signal_mode_to_radio_mode(NULL, signal_mode);
+}
+
+rtems_task radio_command_task(rtems_task_argument arg) {
+    (void)arg;
+    LOG_INFO("RADIO", "Command task started");
+
+    radio_command_message_t msg;
+    size_t msg_size;
+    char cmd_buf[32];
+
+    while (true) {
+        // Block waiting for radio commands
+        rtems_status_code sc = rtems_message_queue_receive(
+            g_radio_cmd_queue,
+            &msg,
+            &msg_size,
+            RTEMS_WAIT,
+            RTEMS_NO_TIMEOUT
+        );
+
+        if (sc != RTEMS_SUCCESSFUL) {
+            LOG_ERROR("RADIO", "Failed to receive command: %s",
+                      rtems_status_text(sc));
+            rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(100));
+            continue;
+        }
+
+        // Format the CAT command based on command type
+        int cmd_len = 0;
+        switch (msg.command) {
+            case RADIO_CMD_SET_FREQ_A:
+                cmd_len = snprintf(cmd_buf, sizeof(cmd_buf),
+                                   "FA%09llu;", (unsigned long long)msg.frequency_hz);
+                LOG_DEBUG("RADIO", "Set VFO-A freq: %llu Hz",
+                          (unsigned long long)msg.frequency_hz);
+                break;
+
+            case RADIO_CMD_SET_FREQ_B:
+                cmd_len = snprintf(cmd_buf, sizeof(cmd_buf),
+                                   "FB%09llu;", (unsigned long long)msg.frequency_hz);
+                LOG_DEBUG("RADIO", "Set VFO-B freq: %llu Hz",
+                          (unsigned long long)msg.frequency_hz);
+                break;
+
+            case RADIO_CMD_SET_MODE_A:
+                // Mode is single hex digit (1-E)
+                cmd_len = snprintf(cmd_buf, sizeof(cmd_buf),
+                                   "MD0%X;", (unsigned int)msg.mode);
+                LOG_DEBUG("RADIO", "Set VFO-A mode: %s",
+                          radio_mode_to_string(msg.mode));
+                break;
+
+            case RADIO_CMD_SET_MODE_B:
+                cmd_len = snprintf(cmd_buf, sizeof(cmd_buf),
+                                   "MD1%X;", (unsigned int)msg.mode);
+                LOG_DEBUG("RADIO", "Set VFO-B mode: %s",
+                          radio_mode_to_string(msg.mode));
+                break;
+
+            default:
+                LOG_WARN("RADIO", "Unknown command type: %d", msg.command);
+                continue;
+        }
+
+        if (cmd_len <= 0 || cmd_len >= (int)sizeof(cmd_buf)) {
+            LOG_ERROR("RADIO", "Command format error");
+            continue;
+        }
+
+        // Send command to radio
+        rtems_semaphore_obtain(g_uart3_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+
+        if (g_radio_fd >= 0) {
+            ssize_t written = write(g_radio_fd, cmd_buf, cmd_len);
+            if (written != cmd_len) {
+                LOG_ERROR("RADIO", "Write failed: %zd/%d", written, cmd_len);
+            } else {
+                fsync(g_radio_fd);
+                LOG_DEBUG("RADIO", "Sent: %s", cmd_buf);
+            }
+        } else {
+            LOG_WARN("RADIO", "Radio FD not open");
+        }
+
+        rtems_semaphore_release(g_uart3_mutex);
+
+        // Small delay between commands to avoid overwhelming the radio
+        rtems_task_wake_after(RTEMS_MILLISECONDS_TO_TICKS(50));
+    }
+}

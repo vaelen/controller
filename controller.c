@@ -84,6 +84,7 @@ rtems_id g_radio_queue;
 rtems_id g_ctrl_cmd_queue;
 rtems_id g_executor_cmd_queue;
 rtems_id g_rotator_cmd_queue;
+rtems_id g_radio_cmd_queue;
 
 // Semaphores (mutexes)
 rtems_id g_uart1_mutex;
@@ -107,6 +108,7 @@ static rtems_id g_rotator_status_task_id;
 static rtems_id g_radio_status_task_id;
 static rtems_id g_radio_freq_task_id;
 static rtems_id g_rotator_cmd_task_id;
+static rtems_id g_radio_cmd_task_id;
 static rtems_id g_status_task_id;
 
 // ============================================================================
@@ -706,6 +708,20 @@ rtems_task status_task(rtems_task_argument arg) {
                 LOG_INFO("STATUS", "TRACKING: %s (NORAD %d)",
                          g_executor_state.sat_name,
                          g_executor_state.current_pass.norad_id);
+                LOG_INFO("STATUS", "  Position: az=%.1f° el=%.1f° range=%.0f km",
+                         g_executor_state.current_azimuth_rad * SGP4_RAD_TO_DEG,
+                         g_executor_state.current_elevation_rad * SGP4_RAD_TO_DEG,
+                         g_executor_state.current_range_km);
+
+                /* Show Doppler-corrected frequencies if channels configured */
+                if (g_executor_state.has_downlink && g_executor_state.last_downlink_freq_hz > 0) {
+                    LOG_INFO("STATUS", "  Downlink: %.6f MHz (Doppler corrected)",
+                             g_executor_state.last_downlink_freq_hz / 1e6);
+                }
+                if (g_executor_state.has_uplink && g_executor_state.last_uplink_freq_hz > 0) {
+                    LOG_INFO("STATUS", "  Uplink: %.6f MHz (Doppler corrected)",
+                             g_executor_state.last_uplink_freq_hz / 1e6);
+                }
             } else if (exec_state == EXEC_STATE_PREPOSITIONING ||
                        exec_state == EXEC_STATE_WAITING_AOS) {
                 LOG_INFO("STATUS", "PREPARING: %s (NORAD %d)",
@@ -716,7 +732,7 @@ rtems_task status_task(rtems_task_argument arg) {
 
         // Upcoming passes status
         {
-            config_t pass_cfg;
+            static config_t pass_cfg;
             config_get_copy(&pass_cfg);
             int display_count = pass_cfg.pass.status_display_count;
 
@@ -793,6 +809,28 @@ rtems_task status_task(rtems_task_argument arg) {
                              p->aos_azimuth_rad * SGP4_RAD_TO_DEG,
                              p->los_azimuth_rad * SGP4_RAD_TO_DEG,
                              p->max_elevation_rad * SGP4_RAD_TO_DEG);
+
+                    /* Show channel info if available */
+                    if (p->has_downlink || p->has_uplink) {
+                        char channel_buf[80];
+                        int pos = 0;
+                        if (p->has_downlink) {
+                            pos += snprintf(channel_buf + pos, sizeof(channel_buf) - pos,
+                                            "Down:%.3f %s",
+                                            p->downlink_channel.frequency_khz / 1000.0,
+                                            signal_mode_to_string(p->downlink_channel.signal_mode));
+                        }
+                        if (p->has_uplink) {
+                            if (pos > 0) {
+                                pos += snprintf(channel_buf + pos, sizeof(channel_buf) - pos, ", ");
+                            }
+                            pos += snprintf(channel_buf + pos, sizeof(channel_buf) - pos,
+                                            "Up:%.3f %s",
+                                            p->uplink_channel.frequency_khz / 1000.0,
+                                            signal_mode_to_string(p->uplink_channel.signal_mode));
+                        }
+                        LOG_INFO("STATUS", "    %s", channel_buf);
+                    }
                 }
 
                 rtems_semaphore_release(g_tle_database_mutex);
@@ -801,7 +839,7 @@ rtems_task status_task(rtems_task_argument arg) {
 
         // Network status
         {
-            config_t net_cfg;
+            static config_t net_cfg;
             config_get_copy(&net_cfg);
 
             if (net_cfg.network.enabled) {
@@ -932,8 +970,8 @@ rtems_task controller_task(rtems_task_argument arg) {
 
         // Check pass queue for upcoming pass predictions and add to priority queue
         {
-            /* Get min schedule elevation from config */
-            config_t pass_filter_cfg;
+            /* Get min schedule elevation from config - static to avoid stack overflow */
+            static config_t pass_filter_cfg;
             config_get_copy(&pass_filter_cfg);
             double min_sched_el_rad = pass_filter_cfg.pass.min_schedule_elevation_deg * SGP4_DEG_TO_RAD;
 
@@ -1063,8 +1101,8 @@ rtems_task controller_task(rtems_task_argument arg) {
         if (have_time) {
             double current_jd = sgp4_unix_to_jd((double)current_time_t);
 
-            /* Get prep time from config */
-            config_t ctrl_cfg;
+            /* Get prep time from config - static to avoid stack overflow */
+            static config_t ctrl_cfg;
             config_get_copy(&ctrl_cfg);
             double prep_time_jd = ctrl_cfg.pass.prep_time_sec / 86400.0;
             double replacement_buffer_jd = (ctrl_cfg.pass.prep_time_sec + 60) / 86400.0;
@@ -1271,6 +1309,19 @@ static rtems_status_code create_message_queues(void) {
         return status;
     }
 
+    // Radio command queue (executor -> radio command task)
+    status = rtems_message_queue_create(
+        rtems_build_name('R', 'A', 'D', 'C'),
+        16,  // Buffer for frequency/mode commands during tracking
+        sizeof(radio_command_message_t),
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_radio_cmd_queue
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create radio command queue: %d", status);
+        return status;
+    }
+
     // Initialize pass priority queue
     pass_queue_init(&g_upcoming_passes);
     memset(&g_scheduled_pass, 0, sizeof(g_scheduled_pass));
@@ -1382,8 +1433,8 @@ static rtems_status_code create_and_start_tasks(void) {
         return status;
     }
 
-    // Get configuration for serial port initialization
-    config_t cfg;
+    // Get configuration for serial port initialization - static to avoid stack overflow
+    static config_t cfg;
     config_get_copy(&cfg);
 
     // Open rotator serial port (shared by antenna and rotator status tasks)
@@ -1496,6 +1547,20 @@ static rtems_status_code create_and_start_tasks(void) {
         return status;
     }
 
+    // Create Radio Command task
+    status = rtems_task_create(
+        rtems_build_name('R', 'A', 'D', 'C'),
+        PRIORITY_RADIO_CMD,
+        TASK_STACK_SIZE,
+        RTEMS_DEFAULT_MODES,
+        RTEMS_DEFAULT_ATTRIBUTES,
+        &g_radio_cmd_task_id
+    );
+    if (status != RTEMS_SUCCESSFUL) {
+        LOG_ERROR("INIT", "Failed to create radio command task: %d", status);
+        return status;
+    }
+
     // Create Controller task
     status = rtems_task_create(
         rtems_build_name('C', 'T', 'R', 'L'),
@@ -1554,6 +1619,9 @@ static rtems_status_code create_and_start_tasks(void) {
     status = rtems_task_start(g_rotator_cmd_task_id, rotator_command_task, 0);
     if (status != RTEMS_SUCCESSFUL) return status;
 
+    status = rtems_task_start(g_radio_cmd_task_id, radio_command_task, 0);
+    if (status != RTEMS_SUCCESSFUL) return status;
+
     status = rtems_task_start(g_controller_task_id, controller_task, 0);
     if (status != RTEMS_SUCCESSFUL) return status;
 
@@ -1604,9 +1672,9 @@ rtems_task Init(rtems_task_argument ignored) {
         LOG_WARN("INIT", "Config init failed, using defaults");
     }
 
-    // Initialize networking
+    // Initialize networking - static config to avoid stack overflow
     {
-        config_t cfg;
+        static config_t cfg;
         config_get_copy(&cfg);
         if (!network_init(&cfg.network)) {
             LOG_WARN("INIT", "Network initialization failed");

@@ -23,8 +23,8 @@ rtems_task gps_task(rtems_task_argument arg) {
     (void)arg;
     LOG_INFO("GPS", "Task started");
 
-    /* Get current configuration */
-    config_t cfg;
+    /* Get current configuration - static to avoid stack overflow */
+    static config_t cfg;
     config_get_copy(&cfg);
 
     int fd = serial_init_from_config(&cfg.gps);

@@ -22,6 +22,7 @@
 #include "sgp4.h"
 #include "https_client.h"
 #include "log.h"
+#include "radio.h"
 
 // ============================================================================
 // TLE Stream Parser for Download Filtering
@@ -446,6 +447,38 @@ rtems_task tle_updater_task(rtems_task_argument arg) {
 }
 
 // ============================================================================
+// Channel Lookup Helper Functions
+// ============================================================================
+
+/*
+ * Look up communication channels for a satellite from the tracking config.
+ * Populates the pass_info channel fields.
+ * Returns true if any channel was found.
+ */
+static bool get_satellite_channels(const config_t *cfg, int norad_id,
+                                   pass_info_t *pass)
+{
+    pass->has_downlink = false;
+    pass->has_uplink = false;
+
+    for (int i = 0; i < cfg->tracked_satellite_count; i++) {
+        if (cfg->tracked_satellites[i].norad_id == norad_id) {
+            if (cfg->tracked_satellites[i].has_downlink) {
+                pass->has_downlink = true;
+                pass->downlink_channel = cfg->tracked_satellites[i].downlink_channel;
+            }
+            if (cfg->tracked_satellites[i].has_uplink) {
+                pass->has_uplink = true;
+                pass->uplink_channel = cfg->tracked_satellites[i].uplink_channel;
+            }
+            return pass->has_downlink || pass->has_uplink;
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
 // Pass Calculator Helper Functions
 // ============================================================================
 
@@ -705,9 +738,11 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
     /* Wait for initial GPS fix and TLE load */
     rtems_task_wake_after(30 * rtems_clock_get_ticks_per_second());
 
+    /* Static config to avoid stack overflow (~5KB struct) */
+    static config_t cfg;
+
     while (true) {
         /* Get configuration */
-        config_t cfg;
         config_get_copy(&cfg);
 
         int prediction_window_min = cfg.pass.prediction_window_min;
@@ -809,6 +844,7 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
             }
 
             pass_info_t pass;
+            memset(&pass, 0, sizeof(pass));  /* Clear channel fields */
             if (find_next_pass(&g_state.satellites[i].state,
                                g_state.satellites[i].tle.norad_id,
                                &observer,
@@ -817,6 +853,9 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
                                &pass)) {
 
                 passes_found++;
+
+                /* Look up communication channels for this satellite */
+                get_satellite_channels(&cfg, pass.norad_id, &pass);
 
                 /* Log pass with full date/time and duration */
                 double aos_unix = sgp4_jd_to_unix(pass.aos_jd);
@@ -848,6 +887,18 @@ rtems_task pass_calculator_task(rtems_task_argument arg) {
                               los_tm_copy.tm_hour, los_tm_copy.tm_min, los_tm_copy.tm_sec);
                     LOG_DEBUG("PASS", "  Duration: %.1f min, MaxEl: %.1f deg",
                               duration_min, pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+                    if (pass.has_downlink) {
+                        LOG_DEBUG("PASS", "  Down: %.3f MHz %s %s",
+                                  pass.downlink_channel.frequency_khz / 1000.0,
+                                  signal_mode_to_string(pass.downlink_channel.signal_mode),
+                                  encoding_to_string(pass.downlink_channel.encoding));
+                    }
+                    if (pass.has_uplink) {
+                        LOG_DEBUG("PASS", "  Up: %.3f MHz %s %s",
+                                  pass.uplink_channel.frequency_khz / 1000.0,
+                                  signal_mode_to_string(pass.uplink_channel.signal_mode),
+                                  encoding_to_string(pass.uplink_channel.encoding));
+                    }
                 }
 
                 /* Send pass to controller */
@@ -952,6 +1003,61 @@ static void handle_start_pass(const pass_info_t *pass) {
     g_executor_state.doppler_valid = false;
     g_executor_state.last_doppler_factor = 1.0;
 
+    /* Copy channel configuration */
+    g_executor_state.has_downlink = pass->has_downlink;
+    g_executor_state.has_uplink = pass->has_uplink;
+    if (pass->has_downlink) {
+        g_executor_state.downlink_channel = pass->downlink_channel;
+    }
+    if (pass->has_uplink) {
+        g_executor_state.uplink_channel = pass->uplink_channel;
+    }
+    g_executor_state.radio_initialized = false;
+    g_executor_state.last_downlink_freq_hz = 0;
+    g_executor_state.last_uplink_freq_hz = 0;
+
+    /* Log channel info */
+    if (pass->has_downlink) {
+        LOG_INFO("EXEC", "  Downlink: %.3f MHz %s",
+                 pass->downlink_channel.frequency_khz / 1000.0,
+                 signal_mode_to_string(pass->downlink_channel.signal_mode));
+    }
+    if (pass->has_uplink) {
+        LOG_INFO("EXEC", "  Uplink: %.3f MHz %s",
+                 pass->uplink_channel.frequency_khz / 1000.0,
+                 signal_mode_to_string(pass->uplink_channel.signal_mode));
+    }
+
+    /* Initialize radio mode (frequency will be set with Doppler in tracking) */
+    if (pass->has_downlink || pass->has_uplink) {
+        static config_t cfg;
+        config_get_copy(&cfg);
+
+        if (pass->has_downlink) {
+            /* Set downlink VFO mode (ground receives) */
+            radio_command_message_t radio_cmd;
+            radio_cmd.mode = signal_mode_to_radio_mode(&cfg, pass->downlink_channel.signal_mode);
+            radio_cmd.command = (cfg.pass.downlink_vfo == 0) ?
+                                RADIO_CMD_SET_MODE_A : RADIO_CMD_SET_MODE_B;
+            radio_cmd.frequency_hz = 0;
+            rtems_message_queue_send(g_radio_cmd_queue, &radio_cmd, sizeof(radio_cmd));
+            LOG_DEBUG("EXEC", "Set downlink VFO mode: %s",
+                      radio_mode_to_string(radio_cmd.mode));
+        }
+
+        if (pass->has_uplink) {
+            /* Set uplink VFO mode (ground transmits) */
+            radio_command_message_t radio_cmd;
+            radio_cmd.mode = signal_mode_to_radio_mode(&cfg, pass->uplink_channel.signal_mode);
+            radio_cmd.command = (cfg.pass.uplink_vfo == 0) ?
+                                RADIO_CMD_SET_MODE_A : RADIO_CMD_SET_MODE_B;
+            radio_cmd.frequency_hz = 0;
+            rtems_message_queue_send(g_radio_cmd_queue, &radio_cmd, sizeof(radio_cmd));
+            LOG_DEBUG("EXEC", "Set uplink VFO mode: %s",
+                      radio_mode_to_string(radio_cmd.mode));
+        }
+    }
+
     /* Send preposition command */
     rotator_command_message_t rot_cmd;
     rot_cmd.command = ROT_CMD_GOTO;
@@ -998,7 +1104,7 @@ static void handle_abort_pass(void) {
 static void process_prepositioning(double current_jd,
                                     const sgp4_geodetic_t *observer) {
     (void)observer;
-    config_t cfg;
+    static config_t cfg;
     config_get_copy(&cfg);
     double prepos_margin_jd = cfg.pass.preposition_margin_sec / 86400.0;
 
@@ -1082,23 +1188,75 @@ static void process_tracking(double current_jd, const sgp4_geodetic_t *observer,
                   angles.elevation_rad * SGP4_RAD_TO_DEG);
     }
 
-    /* Check if doppler correction needs update */
-    /* Use 145.9 MHz as reference for threshold calculation */
-    double doppler_diff_hz = fabs(doppler_factor - g_executor_state.last_doppler_factor) *
-                             145.9e6;
+    /* Update doppler tracking state */
+    g_executor_state.last_doppler_factor = doppler_factor;
+    g_executor_state.doppler_valid = true;
 
-    if (!g_executor_state.doppler_valid ||
-        doppler_diff_hz >= (doppler_threshold_khz * 1000.0)) {
-        g_executor_state.last_doppler_factor = doppler_factor;
-        g_executor_state.doppler_valid = true;
+    /* Get VFO configuration - static to avoid stack overflow */
+    static config_t cfg;
+    config_get_copy(&cfg);
 
-        /* Log doppler info (actual frequency commands stubbed out for now) */
-        double shift_hz = (doppler_factor - 1.0) * 145.9e6;
-        LOG_DEBUG("EXEC", "Doppler: factor=%.9f, shift=%.0f Hz at 145.9 MHz",
-                  doppler_factor, shift_hz);
+    /* Calculate and send Doppler-corrected frequencies */
+    /* Downlink (satellite transmitting to ground): freq = base_freq * doppler_factor */
+    if (g_executor_state.has_downlink) {
+        uint64_t base_freq_hz = (uint64_t)g_executor_state.downlink_channel.frequency_khz * 1000ULL;
+        uint64_t corrected_freq_hz = (uint64_t)(base_freq_hz * doppler_factor);
 
-        /* TODO: Send radio frequency command */
-        /* radio_set_doppler_offset(doppler_factor); */
+        /* Check if frequency change exceeds threshold */
+        int64_t freq_diff_hz = (int64_t)corrected_freq_hz - (int64_t)g_executor_state.last_downlink_freq_hz;
+        if (freq_diff_hz < 0) freq_diff_hz = -freq_diff_hz;
+
+        if (!g_executor_state.radio_initialized ||
+            freq_diff_hz >= (int64_t)(doppler_threshold_khz * 1000.0)) {
+
+            radio_command_message_t radio_cmd;
+            radio_cmd.command = (cfg.pass.downlink_vfo == 0) ?
+                                RADIO_CMD_SET_FREQ_A : RADIO_CMD_SET_FREQ_B;
+            radio_cmd.frequency_hz = corrected_freq_hz;
+            radio_cmd.mode = RADIO_MODE_USB;  /* Unused for freq command */
+            rtems_message_queue_send(g_radio_cmd_queue, &radio_cmd, sizeof(radio_cmd));
+
+            g_executor_state.last_downlink_freq_hz = corrected_freq_hz;
+
+            double shift_hz = (double)corrected_freq_hz - (double)base_freq_hz;
+            LOG_DEBUG("EXEC", "Downlink freq: %.6f MHz (shift: %+.0f Hz)",
+                      corrected_freq_hz / 1e6, shift_hz);
+        }
+    }
+
+    /* Uplink (ground transmitting to satellite): freq = base_freq * (2.0 - doppler_factor) */
+    /* When satellite is approaching (doppler_factor < 1.0), we transmit higher */
+    /* When satellite is receding (doppler_factor > 1.0), we transmit lower */
+    if (g_executor_state.has_uplink) {
+        uint64_t base_freq_hz = (uint64_t)g_executor_state.uplink_channel.frequency_khz * 1000ULL;
+        uint64_t corrected_freq_hz = (uint64_t)(base_freq_hz * (2.0 - doppler_factor));
+
+        /* Check if frequency change exceeds threshold */
+        int64_t freq_diff_hz = (int64_t)corrected_freq_hz - (int64_t)g_executor_state.last_uplink_freq_hz;
+        if (freq_diff_hz < 0) freq_diff_hz = -freq_diff_hz;
+
+        if (!g_executor_state.radio_initialized ||
+            freq_diff_hz >= (int64_t)(doppler_threshold_khz * 1000.0)) {
+
+            radio_command_message_t radio_cmd;
+            radio_cmd.command = (cfg.pass.uplink_vfo == 0) ?
+                                RADIO_CMD_SET_FREQ_A : RADIO_CMD_SET_FREQ_B;
+            radio_cmd.frequency_hz = corrected_freq_hz;
+            radio_cmd.mode = RADIO_MODE_USB;  /* Unused for freq command */
+            rtems_message_queue_send(g_radio_cmd_queue, &radio_cmd, sizeof(radio_cmd));
+
+            g_executor_state.last_uplink_freq_hz = corrected_freq_hz;
+
+            double shift_hz = (double)corrected_freq_hz - (double)base_freq_hz;
+            LOG_DEBUG("EXEC", "Uplink freq: %.6f MHz (shift: %+.0f Hz)",
+                      corrected_freq_hz / 1e6, shift_hz);
+        }
+    }
+
+    /* Mark radio as initialized after first frequency update */
+    if (!g_executor_state.radio_initialized &&
+        (g_executor_state.has_downlink || g_executor_state.has_uplink)) {
+        g_executor_state.radio_initialized = true;
     }
 }
 
@@ -1134,9 +1292,11 @@ rtems_task pass_executor_task(rtems_task_argument arg) {
     memset(&g_executor_state, 0, sizeof(g_executor_state));
     g_executor_state.state = EXEC_STATE_IDLE;
 
+    /* Static config to avoid stack overflow (~5KB struct) */
+    static config_t cfg;
+
     while (true) {
         /* Get configuration */
-        config_t cfg;
         config_get_copy(&cfg);
 
         int poll_ms = cfg.pass.tracking_poll_ms;

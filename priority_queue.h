@@ -13,6 +13,7 @@
 #define PRIORITY_QUEUE_H
 
 #include <stdbool.h>
+#include "config.h"
 
 /* Maximum number of passes in the priority queue */
 #define PASS_QUEUE_CAPACITY 64
@@ -29,6 +30,12 @@ typedef struct pass_info {
     double max_elevation_rad;   /* Maximum elevation angle (radians) */
     double aos_azimuth_rad;     /* Azimuth at AOS (radians) */
     double los_azimuth_rad;     /* Azimuth at LOS (radians) */
+
+    /* Communication channel configuration */
+    bool has_downlink;          /* Has downlink channel (satellite TX, ground RX) */
+    bool has_uplink;            /* Has uplink channel (ground TX, satellite RX) */
+    satellite_channel_t downlink_channel;
+    satellite_channel_t uplink_channel;
 } pass_info_t;
 
 /*

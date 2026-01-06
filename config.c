@@ -138,6 +138,293 @@ int config_speed_to_baud(speed_t speed)
 }
 
 // ============================================================================
+// Default Satellites and Mode Mappings
+// ============================================================================
+
+/* Default tracked satellites (used when no config file or no track= lines) */
+static const struct {
+    int norad_id;
+    channel_direction_t direction;
+    uint32_t frequency_khz;
+    signal_mode_t signal_mode;
+    uint16_t baud_rate;
+    encoding_type_t encoding;
+} default_satellites[] = {
+    { 25544, CHANNEL_DIR_DOWNLINK, 145825, SIGNAL_MODE_AFSK, 1200, ENCODING_AX25 },
+    { 25544, CHANNEL_DIR_UPLINK,   145825, SIGNAL_MODE_AFSK, 1200, ENCODING_AX25 },
+    { 46507, CHANNEL_DIR_DOWNLINK, 435600, SIGNAL_MODE_FSK,  9600, ENCODING_AX25 },
+    { 50466, CHANNEL_DIR_DOWNLINK, 435575, SIGNAL_MODE_CW,   22,   ENCODING_CW   },
+    { 61784, CHANNEL_DIR_DOWNLINK, 437400, SIGNAL_MODE_FSK,  1200, ENCODING_AX25 }
+};
+
+/* Default signal mode to radio mode mappings */
+static const mode_mapping_t default_mode_mappings[] = {
+    { SIGNAL_MODE_CW,    RADIO_MODE_CW      },
+    { SIGNAL_MODE_USB,   RADIO_MODE_USB     },
+    { SIGNAL_MODE_LSB,   RADIO_MODE_LSB     },
+    { SIGNAL_MODE_AM,    RADIO_MODE_AM      },
+    { SIGNAL_MODE_FM,    RADIO_MODE_FM      },
+    { SIGNAL_MODE_RTTY,  RADIO_MODE_RTTY_LSB },
+    { SIGNAL_MODE_FT8,   RADIO_MODE_DATA_USB },
+    { SIGNAL_MODE_FSK,   RADIO_MODE_DATA_FM },
+    { SIGNAL_MODE_AFSK,  RADIO_MODE_DATA_FM },
+    { SIGNAL_MODE_GFSK,  RADIO_MODE_DATA_FM },
+    { SIGNAL_MODE_GMSK,  RADIO_MODE_DATA_FM },
+    { SIGNAL_MODE_OQPSK, RADIO_MODE_DATA_FM }
+};
+
+// ============================================================================
+// Channel Parsing Helpers
+// ============================================================================
+
+/*
+ * Parse channel direction from string.
+ * Accepts: Up, Uplink (ground TX to sat), Down, Downlink (sat TX to ground)
+ * Returns CHANNEL_DIR_DOWNLINK (default) if unrecognized.
+ */
+static channel_direction_t parse_direction(const char *str)
+{
+    if (!str || !*str) {
+        return CHANNEL_DIR_DOWNLINK;
+    }
+    if (strcasecmp_local(str, "Up") == 0 ||
+        strcasecmp_local(str, "Uplink") == 0) {
+        return CHANNEL_DIR_UPLINK;
+    }
+    if (strcasecmp_local(str, "Down") == 0 ||
+        strcasecmp_local(str, "Downlink") == 0) {
+        return CHANNEL_DIR_DOWNLINK;
+    }
+    /* Legacy support */
+    if (strcasecmp_local(str, "RX") == 0) {
+        return CHANNEL_DIR_UPLINK;
+    }
+    if (strcasecmp_local(str, "TX") == 0) {
+        return CHANNEL_DIR_DOWNLINK;
+    }
+    return CHANNEL_DIR_DOWNLINK;
+}
+
+/*
+ * Parse signal mode from string.
+ */
+static signal_mode_t parse_signal_mode(const char *str)
+{
+    if (!str || !*str) {
+        return SIGNAL_MODE_UNKNOWN;
+    }
+    if (strcasecmp_local(str, "CW") == 0)    return SIGNAL_MODE_CW;
+    if (strcasecmp_local(str, "USB") == 0)   return SIGNAL_MODE_USB;
+    if (strcasecmp_local(str, "LSB") == 0)   return SIGNAL_MODE_LSB;
+    if (strcasecmp_local(str, "AM") == 0)    return SIGNAL_MODE_AM;
+    if (strcasecmp_local(str, "FM") == 0)    return SIGNAL_MODE_FM;
+    if (strcasecmp_local(str, "RTTY") == 0)  return SIGNAL_MODE_RTTY;
+    if (strcasecmp_local(str, "FT8") == 0)   return SIGNAL_MODE_FT8;
+    if (strcasecmp_local(str, "FSK") == 0)   return SIGNAL_MODE_FSK;
+    if (strcasecmp_local(str, "AFSK") == 0)  return SIGNAL_MODE_AFSK;
+    if (strcasecmp_local(str, "GFSK") == 0)  return SIGNAL_MODE_GFSK;
+    if (strcasecmp_local(str, "GMSK") == 0)  return SIGNAL_MODE_GMSK;
+    if (strcasecmp_local(str, "OQPSK") == 0) return SIGNAL_MODE_OQPSK;
+    return SIGNAL_MODE_UNKNOWN;
+}
+
+/*
+ * Parse encoding type from string.
+ */
+static encoding_type_t parse_encoding(const char *str)
+{
+    if (!str || !*str) {
+        return ENCODING_UNKNOWN;
+    }
+    if (strcasecmp_local(str, "CW") == 0)    return ENCODING_CW;
+    if (strcasecmp_local(str, "Voice") == 0) return ENCODING_VOICE;
+    if (strcasecmp_local(str, "FT8") == 0)   return ENCODING_FT8;
+    if (strcasecmp_local(str, "RTTY") == 0)  return ENCODING_RTTY;
+    if (strcasecmp_local(str, "AX.25") == 0) return ENCODING_AX25;
+    if (strcasecmp_local(str, "AX25") == 0)  return ENCODING_AX25;
+    if (strcasecmp_local(str, "CCSDS") == 0) return ENCODING_CCSDS;
+    return ENCODING_UNKNOWN;
+}
+
+/*
+ * Parse radio mode from string (for [modes] section).
+ */
+static radio_mode_t parse_radio_mode_string(const char *str)
+{
+    if (!str || !*str) {
+        return RADIO_MODE_FM;
+    }
+    if (strcasecmp_local(str, "LSB") == 0)      return RADIO_MODE_LSB;
+    if (strcasecmp_local(str, "USB") == 0)      return RADIO_MODE_USB;
+    if (strcasecmp_local(str, "CW") == 0)       return RADIO_MODE_CW;
+    if (strcasecmp_local(str, "FM") == 0)       return RADIO_MODE_FM;
+    if (strcasecmp_local(str, "AM") == 0)       return RADIO_MODE_AM;
+    if (strcasecmp_local(str, "RTTY-L") == 0)   return RADIO_MODE_RTTY_LSB;
+    if (strcasecmp_local(str, "CW-R") == 0)     return RADIO_MODE_CW_R;
+    if (strcasecmp_local(str, "DATA-L") == 0)   return RADIO_MODE_DATA_LSB;
+    if (strcasecmp_local(str, "RTTY-U") == 0)   return RADIO_MODE_RTTY_USB;
+    if (strcasecmp_local(str, "DATA-FM") == 0)  return RADIO_MODE_DATA_FM;
+    if (strcasecmp_local(str, "FM-N") == 0)     return RADIO_MODE_FM_N;
+    if (strcasecmp_local(str, "DATA-U") == 0)   return RADIO_MODE_DATA_USB;
+    if (strcasecmp_local(str, "DATA-USB") == 0) return RADIO_MODE_DATA_USB;
+    if (strcasecmp_local(str, "AM-N") == 0)     return RADIO_MODE_AM_N;
+    if (strcasecmp_local(str, "C4FM") == 0)     return RADIO_MODE_C4FM;
+    return RADIO_MODE_FM;
+}
+
+/*
+ * Parse a track= line: NORAD|DIR|FREQ|MODE|BAUD|ENCODING
+ * Returns true on success.
+ */
+static bool parse_track_line(const char *value, int *norad_id,
+                              channel_direction_t *direction,
+                              uint32_t *freq_khz,
+                              signal_mode_t *signal_mode,
+                              uint16_t *baud_rate,
+                              encoding_type_t *encoding)
+{
+    if (!value || !*value) {
+        return false;
+    }
+
+    /* Make a mutable copy */
+    char temp[CONFIG_LINE_MAX];
+    strncpy(temp, value, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+
+    char *saveptr = NULL;
+    char *fields[6] = { NULL };
+    int field_count = 0;
+
+    /* Tokenize by pipe */
+    char *token = strtok_r(temp, "|", &saveptr);
+    while (token != NULL && field_count < 6) {
+        fields[field_count++] = trim(token);
+        token = strtok_r(NULL, "|", &saveptr);
+    }
+
+    /* Must have at least NORAD|DIR|FREQ|MODE */
+    if (field_count < 4) {
+        LOG_WARN("CONFIG", "Invalid track= format: need at least NORAD|DIR|FREQ|MODE");
+        return false;
+    }
+
+    /* Parse NORAD ID */
+    *norad_id = atoi(fields[0]);
+    if (*norad_id <= 0) {
+        LOG_WARN("CONFIG", "Invalid NORAD ID: %s", fields[0]);
+        return false;
+    }
+
+    /* Parse direction */
+    *direction = parse_direction(fields[1]);
+
+    /* Parse frequency */
+    *freq_khz = (uint32_t)atol(fields[2]);
+    if (*freq_khz == 0) {
+        LOG_WARN("CONFIG", "Invalid frequency: %s", fields[2]);
+        return false;
+    }
+
+    /* Parse signal mode */
+    *signal_mode = parse_signal_mode(fields[3]);
+
+    /* Parse baud rate (optional) */
+    *baud_rate = 0;
+    if (field_count > 4 && fields[4] && *fields[4]) {
+        *baud_rate = (uint16_t)atoi(fields[4]);
+    }
+
+    /* Parse encoding (optional) */
+    *encoding = ENCODING_UNKNOWN;
+    if (field_count > 5 && fields[5]) {
+        *encoding = parse_encoding(fields[5]);
+    }
+
+    LOG_DEBUG("CONFIG", "Parsed track: NORAD=%d DIR=%s FREQ=%u MODE=%d BAUD=%u ENC=%d",
+              *norad_id, (*direction == CHANNEL_DIR_UPLINK) ? "Up" : "Down",
+              *freq_khz, *signal_mode, *baud_rate, *encoding);
+
+    return true;
+}
+
+/*
+ * Add or update a tracked satellite with channel info.
+ * If satellite already exists, updates the appropriate channel (uplink or downlink).
+ */
+static void add_tracked_satellite(config_t *cfg, int norad_id,
+                                   const satellite_channel_t *channel)
+{
+    /* Search for existing entry */
+    for (int i = 0; i < cfg->tracked_satellite_count; i++) {
+        if (cfg->tracked_satellites[i].norad_id == norad_id) {
+            /* Found - update appropriate channel */
+            if (channel->direction == CHANNEL_DIR_UPLINK) {
+                cfg->tracked_satellites[i].uplink_channel = *channel;
+                cfg->tracked_satellites[i].has_uplink = true;
+            } else {
+                cfg->tracked_satellites[i].downlink_channel = *channel;
+                cfg->tracked_satellites[i].has_downlink = true;
+            }
+            return;
+        }
+    }
+
+    /* Not found - add new entry */
+    if (cfg->tracked_satellite_count >= CONFIG_MAX_TRACKED_SATELLITES) {
+        LOG_WARN("CONFIG", "Max tracked satellites reached, ignoring NORAD %d", norad_id);
+        return;
+    }
+
+    tracked_satellite_t *sat = &cfg->tracked_satellites[cfg->tracked_satellite_count++];
+    memset(sat, 0, sizeof(*sat));
+    sat->norad_id = norad_id;
+
+    if (channel->direction == CHANNEL_DIR_UPLINK) {
+        sat->uplink_channel = *channel;
+        sat->has_uplink = true;
+    } else {
+        sat->downlink_channel = *channel;
+        sat->has_downlink = true;
+    }
+}
+
+/*
+ * Add NORAD ID to TLE download filter list if not already present.
+ */
+static void add_norad_to_filter(config_t *cfg, int norad_id)
+{
+    for (int i = 0; i < cfg->satellite_count; i++) {
+        if (cfg->satellite_norad_ids[i] == norad_id) {
+            return;  /* Already in list */
+        }
+    }
+    if (cfg->satellite_count < CONFIG_MAX_NORAD_IDS) {
+        cfg->satellite_norad_ids[cfg->satellite_count++] = norad_id;
+    }
+}
+
+/*
+ * Apply default tracked satellites to config.
+ */
+static void apply_default_satellites(config_t *cfg)
+{
+    size_t count = sizeof(default_satellites) / sizeof(default_satellites[0]);
+    for (size_t i = 0; i < count; i++) {
+        satellite_channel_t channel = {
+            .direction = default_satellites[i].direction,
+            .frequency_khz = default_satellites[i].frequency_khz,
+            .signal_mode = default_satellites[i].signal_mode,
+            .baud_rate = default_satellites[i].baud_rate,
+            .encoding = default_satellites[i].encoding
+        };
+        add_tracked_satellite(cfg, default_satellites[i].norad_id, &channel);
+        add_norad_to_filter(cfg, default_satellites[i].norad_id);
+    }
+    LOG_INFO("CONFIG", "Applied %zu default satellite channels", count);
+}
+
+// ============================================================================
 // Section Parsing
 // ============================================================================
 
@@ -150,7 +437,9 @@ typedef enum {
     SECTION_SYSTEM,
     SECTION_NETWORK,
     SECTION_TLE,
-    SECTION_PASS
+    SECTION_PASS,
+    SECTION_TRACKING,
+    SECTION_MODES
 } config_section_t;
 
 /*
@@ -178,6 +467,12 @@ static config_section_t identify_section(const char *name)
     }
     if (strcasecmp_local(name, "pass") == 0) {
         return SECTION_PASS;
+    }
+    if (strcasecmp_local(name, "tracking") == 0) {
+        return SECTION_TRACKING;
+    }
+    if (strcasecmp_local(name, "modes") == 0) {
+        return SECTION_MODES;
     }
     return SECTION_NONE;
 }
@@ -447,6 +742,86 @@ static void process_pass_key(config_t *cfg, const char *key, const char *value)
         } else if (cfg->pass.max_pass_duration_min > 120.0) {
             cfg->pass.max_pass_duration_min = 120.0;
         }
+    } else if (strcasecmp_local(key, "downlink_vfo") == 0) {
+        if (strcasecmp_local(value, "a") == 0 || strcmp(value, "0") == 0) {
+            cfg->pass.downlink_vfo = 0;
+        } else if (strcasecmp_local(value, "b") == 0 || strcmp(value, "1") == 0) {
+            cfg->pass.downlink_vfo = 1;
+        }
+    } else if (strcasecmp_local(key, "uplink_vfo") == 0) {
+        if (strcasecmp_local(value, "a") == 0 || strcmp(value, "0") == 0) {
+            cfg->pass.uplink_vfo = 0;
+        } else if (strcasecmp_local(value, "b") == 0 || strcmp(value, "1") == 0) {
+            cfg->pass.uplink_vfo = 1;
+        }
+    }
+}
+
+/*
+ * Process a key=value pair for the [tracking] section.
+ */
+static void process_tracking_key(config_t *cfg, const char *key, const char *value)
+{
+    if (strcasecmp_local(key, "track") == 0) {
+        cfg->tracking_explicit = true;
+
+        /* Empty value means explicitly no satellites */
+        if (!value || value[0] == '\0') {
+            return;
+        }
+
+        /* Parse track line */
+        int norad_id;
+        channel_direction_t direction;
+        uint32_t freq_khz;
+        signal_mode_t signal_mode;
+        uint16_t baud_rate;
+        encoding_type_t encoding;
+
+        if (parse_track_line(value, &norad_id, &direction, &freq_khz,
+                              &signal_mode, &baud_rate, &encoding)) {
+            satellite_channel_t channel = {
+                .direction = direction,
+                .frequency_khz = freq_khz,
+                .signal_mode = signal_mode,
+                .baud_rate = baud_rate,
+                .encoding = encoding
+            };
+            add_tracked_satellite(cfg, norad_id, &channel);
+            add_norad_to_filter(cfg, norad_id);
+        }
+    }
+}
+
+/*
+ * Process a key=value pair for the [modes] section.
+ * Format: signal_mode = radio_mode (e.g., "AFSK = DATA-FM")
+ */
+static void process_modes_key(config_t *cfg, const char *key, const char *value)
+{
+    signal_mode_t sig_mode = parse_signal_mode(key);
+    radio_mode_t radio_mode = parse_radio_mode_string(value);
+
+    if (sig_mode == SIGNAL_MODE_UNKNOWN) {
+        LOG_WARN("CONFIG", "Unknown signal mode: %s", key);
+        return;
+    }
+
+    /* Check if this mode already has a mapping and update it */
+    for (int i = 0; i < cfg->mode_mapping_count; i++) {
+        if (cfg->mode_mappings[i].signal_mode == sig_mode) {
+            cfg->mode_mappings[i].radio_mode = radio_mode;
+            LOG_DEBUG("CONFIG", "Updated mode mapping: %s -> %d", key, radio_mode);
+            return;
+        }
+    }
+
+    /* Add new mapping */
+    if (cfg->mode_mapping_count < MODE_MAPPING_MAX) {
+        cfg->mode_mappings[cfg->mode_mapping_count].signal_mode = sig_mode;
+        cfg->mode_mappings[cfg->mode_mapping_count].radio_mode = radio_mode;
+        cfg->mode_mapping_count++;
+        LOG_DEBUG("CONFIG", "Added mode mapping: %s -> %d", key, radio_mode);
     }
 }
 
@@ -513,6 +888,20 @@ void config_init_defaults(config_t *cfg)
     /* TLE validation defaults */
     cfg->pass.max_tle_age_days = 3.0;
     cfg->pass.max_pass_duration_min = 20.0;
+
+    /* VFO configuration defaults */
+    cfg->pass.downlink_vfo = 0;  /* VFO-A for downlink (ground RX) */
+    cfg->pass.uplink_vfo = 1;    /* VFO-B for uplink (ground TX) */
+
+    /* Tracked satellites - none by default, apply_default_satellites() called later */
+    cfg->tracked_satellite_count = 0;
+    cfg->tracking_explicit = false;
+
+    /* Initialize mode mappings with defaults */
+    size_t mapping_count = sizeof(default_mode_mappings) / sizeof(default_mode_mappings[0]);
+    memcpy(cfg->mode_mappings, default_mode_mappings,
+           mapping_count * sizeof(mode_mapping_t));
+    cfg->mode_mapping_count = (int)mapping_count;
 
     /* System settings */
     cfg->log_level = LOG_LEVEL_INFO;
@@ -614,6 +1003,12 @@ config_error_t config_load(config_t *cfg, const char *path)
             case SECTION_PASS:
                 process_pass_key(cfg, key, value);
                 break;
+            case SECTION_TRACKING:
+                process_tracking_key(cfg, key, value);
+                break;
+            case SECTION_MODES:
+                process_modes_key(cfg, key, value);
+                break;
             default:
                 LOG_DEBUG("CONFIG", "Line %d: Key '%s' outside section",
                           line_num, key);
@@ -622,6 +1017,14 @@ config_error_t config_load(config_t *cfg, const char *path)
     }
 
     fclose(f);
+
+    /* Apply default satellites if no tracking section was found */
+    if (!cfg->tracking_explicit) {
+        apply_default_satellites(cfg);
+    } else {
+        LOG_INFO("CONFIG", "Loaded %d tracked satellites with channels",
+                 cfg->tracked_satellite_count);
+    }
 
     cfg->loaded = true;
     strncpy(cfg->source_path, file_path, CONFIG_PATH_MAX - 1);
@@ -755,8 +1158,14 @@ rtems_status_code config_system_init(const char *path)
     config_error_t err = config_load(&g_config, path);
     if (err == CONFIG_ERROR_FILE_OPEN) {
         LOG_WARN("CONFIG", "Config file not found, using defaults");
+        /* Apply default satellites since config_load didn't run */
+        apply_default_satellites(&g_config);
     } else if (err != CONFIG_SUCCESS) {
         LOG_WARN("CONFIG", "Config load error %d, using defaults", err);
+        /* Apply default satellites since config_load may not have finished */
+        if (!g_config.tracking_explicit) {
+            apply_default_satellites(&g_config);
+        }
     }
 
     /* Apply log level from config */

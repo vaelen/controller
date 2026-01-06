@@ -13,6 +13,7 @@
 
 #include <rtems.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <termios.h>
 
 // ============================================================================
@@ -33,6 +34,112 @@
 #define CONFIG_IPV4_ADDR_MAX    16   /* "255.255.255.255\0" */
 #define CONFIG_IPV6_ADDR_MAX    46   /* Full IPv6 address with scope */
 #define CONFIG_IFACE_NAME_MAX   16   /* Interface name e.g., "cpsw0" */
+
+#define CONFIG_MAX_TRACKED_SATELLITES 64
+#define MODE_MAPPING_MAX        16
+
+// ============================================================================
+// Radio Mode Types (Yaesu FT-991A CAT protocol)
+// ============================================================================
+
+typedef enum radio_mode {
+    RADIO_MODE_LSB      = 0x1,
+    RADIO_MODE_USB      = 0x2,
+    RADIO_MODE_CW       = 0x3,
+    RADIO_MODE_FM       = 0x4,
+    RADIO_MODE_AM       = 0x5,
+    RADIO_MODE_RTTY_LSB = 0x6,
+    RADIO_MODE_CW_R     = 0x7,
+    RADIO_MODE_DATA_LSB = 0x8,
+    RADIO_MODE_RTTY_USB = 0x9,
+    RADIO_MODE_DATA_FM  = 0xA,
+    RADIO_MODE_FM_N     = 0xB,
+    RADIO_MODE_DATA_USB = 0xC,
+    RADIO_MODE_AM_N     = 0xD,
+    RADIO_MODE_C4FM     = 0xE
+} radio_mode_t;
+
+// ============================================================================
+// Satellite Channel Types
+// ============================================================================
+
+/*
+ * Channel direction from ground station's point of view.
+ * UPLINK = ground transmits to satellite
+ * DOWNLINK = ground receives from satellite
+ */
+typedef enum channel_direction {
+    CHANNEL_DIR_UPLINK = 0,    /* Ground TX -> Satellite RX */
+    CHANNEL_DIR_DOWNLINK = 1   /* Satellite TX -> Ground RX */
+} channel_direction_t;
+
+/*
+ * Signal modulation mode.
+ * Describes the modulation scheme used by the satellite.
+ */
+typedef enum signal_mode {
+    SIGNAL_MODE_CW = 0,
+    SIGNAL_MODE_USB,
+    SIGNAL_MODE_LSB,
+    SIGNAL_MODE_AM,
+    SIGNAL_MODE_FM,
+    SIGNAL_MODE_RTTY,
+    SIGNAL_MODE_FT8,
+    SIGNAL_MODE_FSK,
+    SIGNAL_MODE_AFSK,
+    SIGNAL_MODE_GFSK,
+    SIGNAL_MODE_GMSK,
+    SIGNAL_MODE_OQPSK,
+    SIGNAL_MODE_UNKNOWN
+} signal_mode_t;
+
+#define SIGNAL_MODE_COUNT 13
+
+/*
+ * Data encoding type.
+ * Describes the protocol/encoding used over the channel.
+ */
+typedef enum encoding_type {
+    ENCODING_CW = 0,
+    ENCODING_VOICE,
+    ENCODING_FT8,
+    ENCODING_RTTY,
+    ENCODING_AX25,
+    ENCODING_CCSDS,
+    ENCODING_UNKNOWN
+} encoding_type_t;
+
+#define ENCODING_COUNT 7
+
+/*
+ * Satellite communication channel configuration.
+ */
+typedef struct satellite_channel {
+    channel_direction_t direction;
+    uint32_t frequency_khz;
+    signal_mode_t signal_mode;
+    uint16_t baud_rate;         /* 0 = not applicable (CW, FM voice) */
+    encoding_type_t encoding;
+} satellite_channel_t;
+
+/*
+ * Tracked satellite with communication channels.
+ */
+typedef struct tracked_satellite {
+    int norad_id;
+    bool has_downlink;           /* Has downlink channel (satellite TX, ground RX) */
+    bool has_uplink;             /* Has uplink channel (ground TX, satellite RX) */
+    satellite_channel_t downlink_channel;
+    satellite_channel_t uplink_channel;
+} tracked_satellite_t;
+
+/*
+ * Signal mode to radio mode mapping entry.
+ */
+typedef struct mode_mapping {
+    signal_mode_t signal_mode;
+    radio_mode_t radio_mode;
+} mode_mapping_t;
 
 // ============================================================================
 // Error Codes
@@ -125,6 +232,10 @@ typedef struct pass_config {
     /* TLE validation */
     double max_tle_age_days;       /* Max TLE age before skipping satellite (default: 3.0) */
     double max_pass_duration_min;  /* Max pass duration before warning (default: 20.0) */
+
+    /* VFO mapping configuration */
+    uint8_t downlink_vfo;          /* VFO for downlink (ground RX), 0=VFO-A (default) */
+    uint8_t uplink_vfo;            /* VFO for uplink (ground TX), 1=VFO-B (default) */
 } pass_config_t;
 
 /*
@@ -151,6 +262,15 @@ typedef struct config {
     int satellite_norad_ids[CONFIG_MAX_NORAD_IDS];
     int satellite_count;
     int tle_update_interval_hours;
+
+    /* Tracked satellites with channels */
+    tracked_satellite_t tracked_satellites[CONFIG_MAX_TRACKED_SATELLITES];
+    int tracked_satellite_count;
+    bool tracking_explicit;     /* True if any track= lines were found */
+
+    /* Signal mode to radio mode mapping */
+    mode_mapping_t mode_mappings[MODE_MAPPING_MAX];
+    int mode_mapping_count;
 
     /* Pass prediction configuration */
     pass_config_t pass;

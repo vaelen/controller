@@ -53,4 +53,39 @@ const char *radio_mode_to_string(radio_mode_t mode);
  */
 const char *radio_preamp_to_string(radio_preamp_t preamp);
 
+/*
+ * Radio Command Task
+ *
+ * Receives frequency/mode commands from pass executor and sends
+ * Yaesu CAT protocol commands to the radio.
+ *
+ * @param arg  Unused task argument
+ */
+rtems_task radio_command_task(rtems_task_argument arg);
+
+/*
+ * Convert signal mode to radio mode using config mappings.
+ *
+ * @param cfg          Configuration with mode mappings
+ * @param signal_mode  Signal modulation mode
+ * @return             Corresponding radio mode
+ */
+radio_mode_t signal_mode_to_radio_mode(const config_t *cfg, signal_mode_t signal_mode);
+
+/*
+ * Convert signal mode enum to human-readable string.
+ *
+ * @param mode  Signal modulation mode
+ * @return      String representation (e.g., "AFSK", "GMSK")
+ */
+const char *signal_mode_to_string(signal_mode_t mode);
+
+/*
+ * Convert encoding type enum to human-readable string.
+ *
+ * @param encoding  Encoding type
+ * @return          String representation (e.g., "AX.25", "CCSDS")
+ */
+const char *encoding_to_string(encoding_type_t encoding);
+
 #endif /* RADIO_H */
