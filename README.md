@@ -23,9 +23,10 @@ The system uses multiple RTEMS tasks communicating via message queues:
 | Pass Executor   |       10 | Controls rotator and radio during satellite passes    |
 | Controller      |       20 | Main coordination, pass scheduling                    |
 | Rotator Command |       25 | Sends GS-232A commands to antenna rotator             |
+| Radio Command   |       26 | Sends Doppler-corrected CAT commands to radio         |
 | Rotator Status  |       30 | Parses rotator position responses                     |
 | Radio Status    |       35 | Parses radio CAT protocol responses                   |
-| Radio Frequency |       36 | Sends CAT query commands to radio                     |
+| Radio Frequency |       36 | Sends periodic CAT query commands to radio            |
 | Antenna         |       40 | Polls antenna rotator position periodically           |
 | GPS             |       50 | Reads NMEA data, extracts position/time               |
 | Pass Calculator |       60 | Computes upcoming satellite passes                    |
@@ -76,8 +77,8 @@ When a pass is scheduled, the Pass Executor task controls tracking:
 - Polls satellite position at configurable interval (default: 100ms)
 - Calculates azimuth, elevation, and Doppler shift using SGP4
 - Sends rotator commands when position changes exceed threshold (default: 1 degree)
-- Calculates Doppler correction when shift exceeds threshold (default: 1 kHz)
-- Radio frequency commands are stubbed for future implementation
+- Sends Doppler-corrected frequency commands to radio when shift exceeds threshold (default: 1 kHz)
+- Supports separate uplink and downlink frequencies with independent Doppler correction
 
 ### Rotator Control
 
@@ -88,6 +89,24 @@ The Rotator Command task receives position commands and sends GS-232A protocol c
 - `C2` - Query current position (sent by Antenna Location task)
 
 Position responses are parsed by the Rotator Status task.
+
+### Radio Control
+
+The Radio Command task receives frequency and mode commands from the Pass Executor and sends Yaesu CAT protocol commands to the radio. During satellite passes:
+
+1. **At pass start**: Sets VFO mode based on satellite's signal mode (e.g., DATA-FM for FSK/AFSK)
+2. **During tracking**: Sends Doppler-corrected frequencies at configurable intervals
+
+**Doppler Correction:**
+
+- Downlink (satellite TX → ground RX): `corrected_freq = base_freq × doppler_factor`
+- Uplink (ground TX → satellite RX): `corrected_freq = base_freq × (2.0 - doppler_factor)`
+
+The doppler factor is calculated from the satellite's radial velocity (range rate). When the satellite approaches, the ground station receives higher frequencies and must transmit lower frequencies; when receding, the opposite applies.
+
+**VFO Assignment:**
+
+By default, VFO-A is used for downlink (ground receive) and VFO-B for uplink (ground transmit). This can be configured via `downlink_vfo` and `uplink_vfo` in the `[pass]` section.
 
 ## Building
 
@@ -403,6 +422,27 @@ doppler_threshold = 1.0
 preposition_margin = 30
 max_tle_age = 3.0
 max_pass_duration = 20.0
+downlink_vfo = A
+uplink_vfo = B
+
+[tracking]
+; Satellite communication channels: NORAD|DIR|FREQ_KHZ|MODE|BAUD|ENCODING
+; DIR: Up (ground TX) or Down (ground RX)
+; MODE: CW, USB, LSB, AM, FM, RTTY, FT8, FSK, AFSK, GFSK, GMSK, OQPSK
+; ENCODING: CW, Voice, FT8, RTTY, AX.25, CCSDS (optional)
+track = 25544|Down|145825|AFSK|1200|AX.25
+track = 25544|Up|145825|AFSK|1200|AX.25
+track = 46507|Down|435600|FSK|9600|AX.25
+track = 50466|Down|435575|CW|22|CW
+
+[modes]
+; Signal mode to radio mode mappings (override defaults)
+; Format: signal_mode = radio_mode
+; Signal modes: CW, USB, LSB, AM, FM, RTTY, FT8, FSK, AFSK, GFSK, GMSK, OQPSK
+; Radio modes: LSB, USB, CW, FM, AM, RTTY-L, CW-R, DATA-L, RTTY-U, DATA-FM, FM-N, DATA-U, AM-N, C4FM
+AFSK = DATA-FM
+FSK = DATA-FM
+GMSK = DATA-FM
 ```
 
 ### Configuration Sections
@@ -488,6 +528,85 @@ Default URL: `https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=t
 | `preposition_margin`     | Time before AOS to complete prepositioning (seconds) | `30`    |
 | `max_tle_age`            | Maximum TLE age before skipping satellite (days)     | `3.0`   |
 | `max_pass_duration`      | Maximum pass duration before warning (minutes)       | `20.0`  |
+| `downlink_vfo`           | VFO for downlink/receive (A or B)                    | `A`     |
+| `uplink_vfo`             | VFO for uplink/transmit (A or B)                     | `B`     |
+
+#### [tracking] - Satellite Communication Channels
+
+Defines satellite frequencies and modulation modes for Doppler-corrected radio control during passes. Each `track=` line specifies a communication channel.
+
+**Format:** `track = NORAD|DIR|FREQ_KHZ|MODE|BAUD|ENCODING`
+
+| Field      | Description                                            | Required |
+|------------|--------------------------------------------------------|----------|
+| `NORAD`    | Satellite NORAD catalog ID                             | Yes      |
+| `DIR`      | Direction: `Up` (ground TX) or `Down` (ground RX)      | Yes      |
+| `FREQ_KHZ` | Frequency in kHz (e.g., 145825 for 145.825 MHz)        | Yes      |
+| `MODE`     | Signal modulation mode                                 | Yes      |
+| `BAUD`     | Baud rate (optional, 0 for CW/voice)                   | No       |
+| `ENCODING` | Data encoding protocol (optional)                      | No       |
+
+**Signal Modes:** `CW`, `USB`, `LSB`, `AM`, `FM`, `RTTY`, `FT8`, `FSK`, `AFSK`, `GFSK`, `GMSK`, `OQPSK`
+
+**Encoding Types:** `CW`, `Voice`, `FT8`, `RTTY`, `AX.25`, `CCSDS`
+
+**Example:**
+
+```ini
+[tracking]
+; ISS APRS digipeater (VHF FM packet)
+track = 25544|Down|145825|AFSK|1200|AX.25
+track = 25544|Up|145825|AFSK|1200|AX.25
+
+; GREENCUBE 435 MHz digipeater
+track = 46507|Down|435600|FSK|9600|AX.25
+
+; CW beacon
+track = 50466|Down|435575|CW|22|CW
+```
+
+**Notes:**
+
+- Satellites with no `track=` lines use built-in defaults (ISS, GREENCUBE, etc.)
+- Multiple channels per satellite are supported (uplink + downlink)
+- NORAD IDs in `track=` lines are automatically added to the TLE download filter
+- If a `[tracking]` section exists with any `track=` lines, defaults are not applied
+
+#### [modes] - Signal Mode to Radio Mode Mappings
+
+Maps satellite signal modulation modes to radio operating modes for automatic mode setting during passes. These mappings determine which radio mode (e.g., DATA-FM, USB) is used when tracking a satellite with a specific signal mode (e.g., AFSK, FSK).
+
+**Format:** `signal_mode = radio_mode`
+
+**Default Mappings:**
+
+| Signal Mode | Default Radio Mode |
+|-------------|--------------------|
+| CW          | CW                 |
+| USB         | USB                |
+| LSB         | LSB                |
+| AM          | AM                 |
+| FM          | FM                 |
+| RTTY        | RTTY-L             |
+| FT8         | DATA-U             |
+| FSK         | DATA-FM            |
+| AFSK        | DATA-FM            |
+| GFSK        | DATA-FM            |
+| GMSK        | DATA-FM            |
+| OQPSK       | DATA-FM            |
+
+**Radio Modes (Yaesu FT-991A):** `LSB`, `USB`, `CW`, `FM`, `AM`, `RTTY-L`, `CW-R`, `DATA-L`, `RTTY-U`, `DATA-FM`, `FM-N`, `DATA-U`, `AM-N`, `C4FM`
+
+**Example:**
+
+```ini
+[modes]
+; Use narrow FM for digital modes
+FSK = FM-N
+AFSK = FM-N
+; Use USB for weak signal digital
+GMSK = DATA-U
+```
 
 ### Notes
 
@@ -510,11 +629,14 @@ See [sdcard.md](sdcard.md) for technical details on SD card support.
 
 ```text
 sattrack_controller/
-├── controller.c      # Main application, task implementations
+├── controller.c      # Main application, task creation and coordination
 ├── init.c            # RTEMS configuration
+├── pass.c/h          # Pass prediction, TLE management, pass execution
+├── radio.c/h         # Radio control tasks (CAT protocol)
 ├── sgp4.c/h          # SGP4/SDP4 satellite propagation
 ├── nmea.c/h          # NMEA 0183 parser
 ├── config.c/h        # Configuration system
+├── shared.h          # Shared types, message definitions, IPC objects
 ├── log.c/h           # Logging system
 ├── priority_queue.c/h # Pass priority queue
 ├── https_client.c/h  # HTTPS client for TLE download
