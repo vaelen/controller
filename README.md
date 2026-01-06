@@ -2,6 +2,8 @@
 
 An RTEMS-based satellite groundstation controller that coordinates GPS positioning, TLE database management, pass prediction, and antenna control for automated satellite tracking.
 
+It is meant to run on a BeagleBone Black SBC with the assistance of an [I/O cape that I created](githab.com/vaelen/bbb-io-cape), but the cape is entirely optional.
+
 ## Overview
 
 This controller runs on embedded systems using RTEMS (Real-Time Executive for Multiprocessor Systems) and provides:
