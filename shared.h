@@ -260,6 +260,10 @@ typedef struct controller_state {
     sgp4_geodetic_t observer_location;
     bool location_valid;
 
+    // Last logged location (for threshold-based logging)
+    sgp4_geodetic_t last_logged_location;
+    bool last_logged_location_valid;
+
     // Current time from GPS
     time_t current_time;
     bool time_valid;

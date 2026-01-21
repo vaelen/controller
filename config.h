@@ -213,6 +213,14 @@ typedef struct network_config {
 } network_config_t;
 
 /*
+ * GPS configuration.
+ */
+typedef struct gps_config {
+    double location_log_threshold_deg;  /* Min lat/lon change to log (default: 0.0001 = ~11m) */
+    double altitude_log_threshold_km;   /* Min altitude change to log (default: 0.01 = 10m) */
+} gps_config_t;
+
+/*
  * Pass prediction and scheduling configuration.
  */
 typedef struct pass_config {
@@ -271,6 +279,9 @@ typedef struct config {
     /* Signal mode to radio mode mapping */
     mode_mapping_t mode_mappings[MODE_MAPPING_MAX];
     int mode_mapping_count;
+
+    /* GPS configuration */
+    gps_config_t gps_cfg;
 
     /* Pass prediction configuration */
     pass_config_t pass;

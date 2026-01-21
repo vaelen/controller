@@ -439,7 +439,8 @@ typedef enum {
     SECTION_TLE,
     SECTION_PASS,
     SECTION_TRACKING,
-    SECTION_MODES
+    SECTION_MODES,
+    SECTION_GPS
 } config_section_t;
 
 /*
@@ -473,6 +474,9 @@ static config_section_t identify_section(const char *name)
     }
     if (strcasecmp_local(name, "modes") == 0) {
         return SECTION_MODES;
+    }
+    if (strcasecmp_local(name, "gps") == 0) {
+        return SECTION_GPS;
     }
     return SECTION_NONE;
 }
@@ -825,6 +829,24 @@ static void process_modes_key(config_t *cfg, const char *key, const char *value)
     }
 }
 
+/*
+ * Process a key=value pair for the [gps] section.
+ */
+static void process_gps_key(config_t *cfg, const char *key, const char *value)
+{
+    if (strcasecmp_local(key, "location_log_threshold") == 0) {
+        cfg->gps_cfg.location_log_threshold_deg = atof(value);
+        if (cfg->gps_cfg.location_log_threshold_deg < 0.0) {
+            cfg->gps_cfg.location_log_threshold_deg = 0.0;
+        }
+    } else if (strcasecmp_local(key, "altitude_log_threshold") == 0) {
+        cfg->gps_cfg.altitude_log_threshold_km = atof(value);
+        if (cfg->gps_cfg.altitude_log_threshold_km < 0.0) {
+            cfg->gps_cfg.altitude_log_threshold_km = 0.0;
+        }
+    }
+}
+
 // ============================================================================
 // Public Functions
 // ============================================================================
@@ -870,6 +892,10 @@ void config_init_defaults(config_t *cfg)
     cfg->satellite_count = 0;
     memset(cfg->satellite_norad_ids, 0, sizeof(cfg->satellite_norad_ids));
     cfg->tle_update_interval_hours = 6;
+
+    /* GPS logging thresholds */
+    cfg->gps_cfg.location_log_threshold_deg = 0.0001;  /* ~11m at equator */
+    cfg->gps_cfg.altitude_log_threshold_km = 0.01;     /* 10m */
 
     /* Pass prediction defaults */
     cfg->pass.prediction_window_min = 60;
@@ -1008,6 +1034,9 @@ config_error_t config_load(config_t *cfg, const char *path)
                 break;
             case SECTION_MODES:
                 process_modes_key(cfg, key, value);
+                break;
+            case SECTION_GPS:
+                process_gps_key(cfg, key, value);
                 break;
             default:
                 LOG_DEBUG("CONFIG", "Line %d: Key '%s' outside section",

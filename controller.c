@@ -889,8 +889,15 @@ rtems_task controller_task(rtems_task_argument arg) {
     LOG_INFO("CTRL", "Controller task started");
 
     while (true) {
+        // Get configuration once per loop iteration - static to avoid stack overflow
+        static config_t cfg;
+        config_get_copy(&cfg);
+
         // Check GPS queue for updates
         {
+            double lat_lon_threshold_rad = cfg.gps_cfg.location_log_threshold_deg * SGP4_DEG_TO_RAD;
+            double alt_threshold_km = cfg.gps_cfg.altitude_log_threshold_km;
+
             gps_message_t gps_msg;
             size_t gps_size;
             while (rtems_message_queue_receive(g_gps_queue, &gps_msg, &gps_size,
@@ -899,10 +906,28 @@ rtems_task controller_task(rtems_task_argument arg) {
                 // Update shared state
                 rtems_semaphore_obtain(g_state_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
 
-                bool log_location = !g_state.location_valid ||
-                    g_state.observer_location.lat_rad != gps_msg.location.lat_rad ||
-                    g_state.observer_location.lon_rad != gps_msg.location.lon_rad ||
-                    g_state.observer_location.alt_km != gps_msg.location.alt_km;
+                // Determine if we should log the location change
+                // Compare against last LOGGED location, not current location
+                bool log_location = false;
+                if (!g_state.last_logged_location_valid) {
+                    // First valid location - always log
+                    log_location = true;
+                } else {
+                    // Check if change exceeds thresholds since last logged position
+                    double lat_diff = gps_msg.location.lat_rad - g_state.last_logged_location.lat_rad;
+                    double lon_diff = gps_msg.location.lon_rad - g_state.last_logged_location.lon_rad;
+                    double alt_diff = gps_msg.location.alt_km - g_state.last_logged_location.alt_km;
+
+                    if (lat_diff < 0) lat_diff = -lat_diff;
+                    if (lon_diff < 0) lon_diff = -lon_diff;
+                    if (alt_diff < 0) alt_diff = -alt_diff;
+
+                    if (lat_diff >= lat_lon_threshold_rad ||
+                        lon_diff >= lat_lon_threshold_rad ||
+                        alt_diff >= alt_threshold_km) {
+                        log_location = true;
+                    }
+                }
 
                 bool log_time = !g_state.time_valid;
 
@@ -910,6 +935,13 @@ rtems_task controller_task(rtems_task_argument arg) {
                 g_state.location_valid = true;
                 g_state.current_time = gps_msg.utc_time;
                 g_state.time_valid = true;
+
+                // Update last logged location if we're going to log
+                if (log_location) {
+                    g_state.last_logged_location = gps_msg.location;
+                    g_state.last_logged_location_valid = true;
+                }
+
                 rtems_semaphore_release(g_state_mutex);
 
                 // Update log timestamp
@@ -970,10 +1002,7 @@ rtems_task controller_task(rtems_task_argument arg) {
 
         // Check pass queue for upcoming pass predictions and add to priority queue
         {
-            /* Get min schedule elevation from config - static to avoid stack overflow */
-            static config_t pass_filter_cfg;
-            config_get_copy(&pass_filter_cfg);
-            double min_sched_el_rad = pass_filter_cfg.pass.min_schedule_elevation_deg * SGP4_DEG_TO_RAD;
+            double min_sched_el_rad = cfg.pass.min_schedule_elevation_deg * SGP4_DEG_TO_RAD;
 
             pass_message_t pass_msg;
             size_t pass_size;
@@ -985,7 +1014,7 @@ rtems_task controller_task(rtems_task_argument arg) {
                     LOG_DEBUG("CTRL", "Skipping pass NORAD %d: max_el=%.1f° < min=%.1f°",
                              pass_msg.pass.norad_id,
                              pass_msg.pass.max_elevation_rad * SGP4_RAD_TO_DEG,
-                             pass_filter_cfg.pass.min_schedule_elevation_deg);
+                             cfg.pass.min_schedule_elevation_deg);
                     continue;
                 }
 
@@ -1101,11 +1130,8 @@ rtems_task controller_task(rtems_task_argument arg) {
         if (have_time) {
             double current_jd = sgp4_unix_to_jd((double)current_time_t);
 
-            /* Get prep time from config - static to avoid stack overflow */
-            static config_t ctrl_cfg;
-            config_get_copy(&ctrl_cfg);
-            double prep_time_jd = ctrl_cfg.pass.prep_time_sec / 86400.0;
-            double replacement_buffer_jd = (ctrl_cfg.pass.prep_time_sec + 60) / 86400.0;
+            double prep_time_jd = cfg.pass.prep_time_sec / 86400.0;
+            double replacement_buffer_jd = (cfg.pass.prep_time_sec + 60) / 86400.0;
 
             /* Lock pass queue mutex for all pass scheduling operations */
             rtems_semaphore_obtain(g_pass_queue_mutex, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
@@ -1645,6 +1671,7 @@ rtems_task Init(rtems_task_argument ignored) {
     // Initialize shared state
     memset(&g_state, 0, sizeof(g_state));
     g_state.location_valid = false;
+    g_state.last_logged_location_valid = false;
     g_state.time_valid = false;
     g_state.antenna_position_valid = false;
     g_state.satellite_count = 0;
