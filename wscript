@@ -40,5 +40,5 @@ def build(bld):
         source = ['console-config.c', 'init.c', 'controller.c', 'log.c', 'sgp4.c',
                   'nmea.c', 'config.c', 'https_client.c', 'openssl_stubs.c',
                   'priority_queue.c', 'serial.c', 'gps.c', 'rotator.c', 'radio.c',
-                  'pass.c'],)
+                  'pass.c', 'rtc.c'],)
 

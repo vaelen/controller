@@ -247,6 +247,19 @@ typedef struct pass_config {
 } pass_config_t;
 
 /*
+ * RTC (DS3231MZ) configuration.
+ */
+typedef struct rtc_config {
+    char device_path[CONFIG_PATH_MAX];  /* I2C device path (default: /dev/iic2) */
+    int sync_interval_sec;              /* Min seconds between GPS syncs (default: 3600) */
+    int max_drift_sec;                  /* Max drift before forced sync (default: 2) */
+    int alarm_margin_sec;               /* Seconds before AOS to set alarm (default: 600) */
+    bool use_at_startup;                /* Use RTC time at startup (default: true) */
+    int gpio_interrupt;                 /* GPIO pin for alarm interrupt (default: 61) */
+    int gpio_32khz;                     /* GPIO pin for 32kHz output (default: 60) */
+} rtc_config_t;
+
+/*
  * Complete configuration structure.
  */
 typedef struct config {
@@ -285,6 +298,9 @@ typedef struct config {
 
     /* Pass prediction configuration */
     pass_config_t pass;
+
+    /* RTC configuration */
+    rtc_config_t rtc;
 
     /* System settings */
     int log_level;              /* LOG_LEVEL_DEBUG through LOG_LEVEL_ERROR */

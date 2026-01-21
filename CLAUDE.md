@@ -67,6 +67,7 @@ This is a satellite tracking controller for RTEMS embedded systems. The codebase
 | `log.c/h`            | Thread-safe logging system                        |
 | `priority_queue.c/h` | Pass priority queue for scheduling                |
 | `https_client.c/h`   | HTTPS client for TLE download                     |
+| `rtc.c/h`            | DS3231MZ real-time clock driver (I2C)             |
 | `date.h`             | Date/time utilities (third-party, Howard Hinnant) |
 
 ### Tasks
@@ -220,6 +221,80 @@ All angles in the library are in **radians** unless explicitly noted (e.g., conf
 | `/dev/ttyS1` | GPS     | NMEA input      | 9600   |
 | `/dev/ttyS2` | Rotator | GS-232A control | 9600   |
 | `/dev/ttyS3` | Radio   | Yaesu CAT       | 38400  |
+
+## DS3231MZ Real-Time Clock
+
+The controller supports an optional DS3231MZ RTC connected to I2C2 (address 0x68). The RTC provides:
+
+- **Immediate time at boot**: System time is set from RTC before GPS lock
+- **GPS-disciplined updates**: RTC is synchronized when GPS provides valid time
+- **Alarm functionality**: RTC alarm can wake the system before satellite passes
+
+### Hardware Connections
+
+| Signal   | GPIO | Function                          |
+|----------|------|-----------------------------------|
+| I2C2_SDA | P9.20| I2C data                          |
+| I2C2_SCL | P9.19| I2C clock                         |
+| INT#     | 61   | Alarm interrupt (active low)      |
+| 32KHz    | 60   | 32.768 kHz clock output (future)  |
+
+### Configuration
+
+```ini
+[rtc]
+device = /dev/iic2
+sync_interval = 3600
+max_drift = 2
+alarm_margin = 600
+use_at_startup = true
+gpio_interrupt = 61
+gpio_32khz = 60
+```
+
+### Enabling I2C Support in libbsd
+
+The RTC driver requires I2C support in rtems-libbsd. The I2C module definitions have been added to the rtems-libbsd fork, but the I2C source files must be forwarded and the library rebuilt.
+
+To enable I2C support:
+
+1. **Forward I2C source files** (in rtems-libbsd directory):
+
+   ```bash
+   cd ~/rtems/src/rtems-libbsd
+   mkdir -p freebsd/sys/dev/iicbus
+   python3 freebsd-to-rtems.py
+   ```
+
+2. **Generate I2C interface files** (if not present):
+
+   ```bash
+   awk -f freebsd-org/sys/tools/makeobjops.awk \
+       freebsd-org/sys/dev/iicbus/iicbus_if.m -h
+   mv iicbus_if.h rtemsbsd/include/rtems/bsd/local/
+
+   awk -f freebsd-org/sys/tools/makeobjops.awk \
+       freebsd-org/sys/dev/iicbus/iicbus_if.m -c
+   echo '#include <machine/rtems-bsd-kernel-space.h>' > rtemsbsd/local/iicbus_if.c
+   cat iicbus_if.c >> rtemsbsd/local/iicbus_if.c
+   rm iicbus_if.c
+   ```
+
+3. **Rebuild libbsd**:
+
+   ```bash
+   ./waf configure --rtems=$HOME/rtems/7 \
+       --rtems-bsp=arm/beagleboneblack \
+       --buildset=buildset/bbb.ini
+   ./waf
+   ./waf install
+   ```
+
+4. **Update init.c**: Uncomment the I2C driver references
+
+5. **Define RTC_I2C_AVAILABLE**: Add to compiler flags or rtc.c
+
+When I2C is not available, the RTC driver gracefully degrades and the system operates GPS-only.
 
 ## Key Data Structures
 

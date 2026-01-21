@@ -43,6 +43,7 @@
 #include "rotator.h"
 #include "radio.h"
 #include "pass.h"
+#include "rtc.h"
 
 #include <sys/stat.h>
 #include <rtems/dosfs.h>
@@ -964,6 +965,23 @@ rtems_task controller_task(rtems_task_argument arg) {
                              tm_utc->tm_min,
                              tm_utc->tm_sec);
                 }
+
+                // Sync GPS time to RTC
+                if (g_state.rtc_valid) {
+                    if (log_time) {
+                        // First valid GPS time - force sync to RTC
+                        rtc_sync_from_gps(gps_msg.utc_time, cfg.rtc.max_drift_sec, true);
+                        g_state.rtc_last_sync = gps_msg.utc_time;
+                    } else {
+                        // Check if periodic sync is needed
+                        time_t last_sync = rtc_get_last_sync_time();
+                        if (last_sync == 0 ||
+                            (gps_msg.utc_time - last_sync) >= cfg.rtc.sync_interval_sec) {
+                            rtc_sync_from_gps(gps_msg.utc_time, cfg.rtc.max_drift_sec, false);
+                            g_state.rtc_last_sync = gps_msg.utc_time;
+                        }
+                    }
+                }
             }
         }
 
@@ -1164,6 +1182,17 @@ rtems_task controller_task(rtems_task_argument arg) {
                              next_pass.norad_id,
                              aos_tm->tm_hour, aos_tm->tm_min, aos_tm->tm_sec,
                              next_pass.max_elevation_rad * SGP4_RAD_TO_DEG);
+
+                    // Set RTC alarm for pass wake-up
+                    if (g_state.rtc_valid && cfg.rtc.alarm_margin_sec > 0) {
+                        time_t alarm_time = aos_time - cfg.rtc.alarm_margin_sec;
+                        if (alarm_time > current_time_t) {
+                            if (rtc_set_alarm1(alarm_time) == RTC_SUCCESS) {
+                                LOG_DEBUG("CTRL", "RTC alarm set for %d sec before AOS",
+                                          cfg.rtc.alarm_margin_sec);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1697,6 +1726,40 @@ rtems_task Init(rtems_task_argument ignored) {
     status = config_system_init(NULL);
     if (status != RTEMS_SUCCESSFUL) {
         LOG_WARN("INIT", "Config init failed, using defaults");
+    }
+
+    // Initialize RTC - do this early so we have time before GPS lock
+    {
+        static config_t rtc_cfg;
+        config_get_copy(&rtc_cfg);
+
+        rtc_error_t rtc_err = rtc_init(rtc_cfg.rtc.device_path);
+        if (rtc_err == RTC_SUCCESS) {
+            g_state.rtc_valid = true;
+
+            if (rtc_cfg.rtc.use_at_startup) {
+                time_t rtc_time;
+                if (rtc_read_time(&rtc_time) == RTC_SUCCESS) {
+                    // Set system time from RTC
+                    log_set_time(rtc_time);
+                    g_state.current_time = rtc_time;
+
+                    // Only mark time valid if oscillator wasn't stopped
+                    if (rtc_is_valid()) {
+                        g_state.time_valid = true;
+                        struct tm *tm_utc = gmtime(&rtc_time);
+                        LOG_INFO("INIT", "System time set from RTC: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                                 tm_utc->tm_year + 1900, tm_utc->tm_mon + 1, tm_utc->tm_mday,
+                                 tm_utc->tm_hour, tm_utc->tm_min, tm_utc->tm_sec);
+                    } else {
+                        LOG_WARN("INIT", "RTC oscillator was stopped - time may be inaccurate");
+                    }
+                }
+            }
+        } else {
+            g_state.rtc_valid = false;
+            LOG_WARN("INIT", "RTC init failed (%d), GPS-only time mode", rtc_err);
+        }
     }
 
     // Initialize networking - static config to avoid stack overflow

@@ -440,7 +440,8 @@ typedef enum {
     SECTION_PASS,
     SECTION_TRACKING,
     SECTION_MODES,
-    SECTION_GPS
+    SECTION_GPS,
+    SECTION_RTC
 } config_section_t;
 
 /*
@@ -477,6 +478,9 @@ static config_section_t identify_section(const char *name)
     }
     if (strcasecmp_local(name, "gps") == 0) {
         return SECTION_GPS;
+    }
+    if (strcasecmp_local(name, "rtc") == 0) {
+        return SECTION_RTC;
     }
     return SECTION_NONE;
 }
@@ -847,6 +851,38 @@ static void process_gps_key(config_t *cfg, const char *key, const char *value)
     }
 }
 
+/*
+ * Process a key=value pair for the [rtc] section.
+ */
+static void process_rtc_key(config_t *cfg, const char *key, const char *value)
+{
+    if (strcasecmp_local(key, "device") == 0) {
+        strncpy(cfg->rtc.device_path, value, CONFIG_PATH_MAX - 1);
+        cfg->rtc.device_path[CONFIG_PATH_MAX - 1] = '\0';
+    } else if (strcasecmp_local(key, "sync_interval") == 0) {
+        cfg->rtc.sync_interval_sec = atoi(value);
+        if (cfg->rtc.sync_interval_sec < 60) {
+            cfg->rtc.sync_interval_sec = 60;
+        }
+    } else if (strcasecmp_local(key, "max_drift") == 0) {
+        cfg->rtc.max_drift_sec = atoi(value);
+        if (cfg->rtc.max_drift_sec < 1) {
+            cfg->rtc.max_drift_sec = 1;
+        }
+    } else if (strcasecmp_local(key, "alarm_margin") == 0) {
+        cfg->rtc.alarm_margin_sec = atoi(value);
+        if (cfg->rtc.alarm_margin_sec < 60) {
+            cfg->rtc.alarm_margin_sec = 60;
+        }
+    } else if (strcasecmp_local(key, "use_at_startup") == 0) {
+        cfg->rtc.use_at_startup = parse_bool(value, true);
+    } else if (strcasecmp_local(key, "gpio_interrupt") == 0) {
+        cfg->rtc.gpio_interrupt = atoi(value);
+    } else if (strcasecmp_local(key, "gpio_32khz") == 0) {
+        cfg->rtc.gpio_32khz = atoi(value);
+    }
+}
+
 // ============================================================================
 // Public Functions
 // ============================================================================
@@ -932,6 +968,16 @@ void config_init_defaults(config_t *cfg)
     /* System settings */
     cfg->log_level = LOG_LEVEL_INFO;
     cfg->status_interval_sec = 30;
+
+    /* RTC defaults */
+    strncpy(cfg->rtc.device_path, "/dev/iic2", CONFIG_PATH_MAX - 1);
+    cfg->rtc.device_path[CONFIG_PATH_MAX - 1] = '\0';
+    cfg->rtc.sync_interval_sec = 3600;       /* Sync from GPS every hour */
+    cfg->rtc.max_drift_sec = 2;              /* 2 second drift threshold */
+    cfg->rtc.alarm_margin_sec = 600;         /* 10 minutes before AOS */
+    cfg->rtc.use_at_startup = true;
+    cfg->rtc.gpio_interrupt = 61;            /* GPIO for alarm interrupt */
+    cfg->rtc.gpio_32khz = 60;                /* GPIO for 32kHz output */
 
     /* Network defaults */
     cfg->network.enabled = true;
@@ -1037,6 +1083,9 @@ config_error_t config_load(config_t *cfg, const char *path)
                 break;
             case SECTION_GPS:
                 process_gps_key(cfg, key, value);
+                break;
+            case SECTION_RTC:
+                process_rtc_key(cfg, key, value);
                 break;
             default:
                 LOG_DEBUG("CONFIG", "Line %d: Key '%s' outside section",

@@ -41,7 +41,8 @@ typedef enum message_type {
     MSG_ANTENNA_POSITION,
     MSG_COMMAND_ANTENNA,
     MSG_RADIO_STATUS,
-    MSG_CONFIG_RELOAD
+    MSG_CONFIG_RELOAD,
+    MSG_RTC_ALARM
 } message_type_t;
 
 // Radio pre-amp setting (radio_mode_t is now defined in config.h)
@@ -287,6 +288,10 @@ typedef struct controller_state {
     radio_preamp_t radio_preamp;
     uint8_t radio_active_vfo;
     bool radio_status_valid;
+
+    // RTC state
+    bool rtc_valid;                  // True if RTC is initialized and oscillator OK
+    time_t rtc_last_sync;            // Last GPS-to-RTC sync time
 } controller_state_t;
 
 // ============================================================================

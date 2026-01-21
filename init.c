@@ -81,3 +81,27 @@ SYSINIT_DRIVER_REFERENCE(mmcsd, mmc);
 SYSINIT_DRIVER_REFERENCE(cpswss, simplebus);
 SYSINIT_DRIVER_REFERENCE(cpsw, cpswss);
 SYSINIT_DRIVER_REFERENCE(ukphy, miibus);
+
+/*
+ * I2C driver for DS3231MZ RTC on I2C2.
+ *
+ * NOTE: The ti_i2c driver is not currently included in the libbsd bbb.ini
+ * buildset. To enable I2C support, the libbsd library must be rebuilt with
+ * I2C drivers enabled. Add the following to bbb.ini under [modules]:
+ *   dev_iicbus = on
+ *   arm_ti_i2c = on
+ *
+ * Then rebuild libbsd with:
+ *   cd ~/rtems/src/rtems-libbsd
+ *   ./waf configure --rtems=$HOME/rtems/7 --rtems-bsp=arm/beagleboneblack \
+ *       --buildset=buildset/bbb.ini
+ *   ./waf
+ *   ./waf install
+ *
+ * Once I2C is available in libbsd, uncomment these driver references:
+ */
+#if 0
+SYSINIT_DRIVER_REFERENCE(ti_i2c, simplebus);
+SYSINIT_DRIVER_REFERENCE(iicbus, ti_i2c);
+SYSINIT_DRIVER_REFERENCE(iic, iicbus);
+#endif
